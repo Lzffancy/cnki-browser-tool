@@ -10,9 +10,9 @@
 
 ```
 Agent / Tool 调用
-      │  HTTP POST /v1/call
+      │  MCP stdio（推荐）或 HTTP POST /v1/call（调试）
       ▼
-backend/bridge_server.py   本机桥接服务，仅监听 127.0.0.1
+backend/bridge_server.py   本机桥接服务；扩展侧的 HTTP 长轮询固定跑在后台线程，仅监听 127.0.0.1
       │  长连接 / 消息转发
       ▼
 extension/service-worker.js   MV3 Service Worker，批次状态持久化在 chrome.storage.local
@@ -23,7 +23,7 @@ extension/content/cnki-page.js   注入到 CNKI 页面的内容脚本，读取 D
 用户已登录的 Chrome 标签页（kns.cnki.net）
 ```
 
-- **backend/bridge_server.py**：本机 HTTP 服务，把 Agent 的 Tool 调用转发给扩展，是唯一暴露给 Agent 的入口。
+- **backend/bridge_server.py**：本机桥接服务，把 Agent 的 Tool 调用转发给扩展，是唯一暴露给 Agent 的入口。支持两种模式：`--mode mcp`（标准 MCP stdio server，14 个动作注册为具名 Tool，JSON Schema 校验参数）和 `--mode http`（默认，裸 HTTP，兼容 curl 手工调试）。两种模式下，扩展侧看到的都是同一套 HTTP 长轮询端点——Chrome MV3 Service Worker 没有 `listen()` 能力，这段传输方式不受 Agent 侧协议选型影响。
 - **extension/**：Chrome MV3 扩展本体。
   - `service-worker.js`：调度中心，处理会话状态、检索、批量下载队列，用 `chrome.alarms` + `chrome.storage.local` 解决 Service Worker 休眠导致的批次中断问题。
   - `content/cnki-page.js`：注入到知网页面的内容脚本，负责解析检索结果、点击详情页下载按钮等页面级操作。
@@ -43,10 +43,19 @@ extension/content/cnki-page.js   注入到 CNKI 页面的内容脚本，读取 D
 
 1. Chrome 打开 `chrome://extensions`，开启开发者模式，「加载已解压的扩展程序」选择 `extension/` 目录。
 2. 启动本机桥接服务：
-   ```bash
-   python backend/bridge_server.py
-   ```
-3. Agent 端按 `TOOL_REFERENCE.md` 的说明，向 `http://127.0.0.1:8765/v1/call` 发起 Tool 调用。
+   - **MCP 模式（推荐给 Agent host，如 WorkBuddy）**：
+     ```bash
+     python -m venv backend/.venv          # 只需一次
+     backend/.venv/Scripts/pip install "mcp<2"
+     backend/.venv/Scripts/python.exe backend/bridge_server.py --mode mcp
+     ```
+     或直接把它注册进 Agent host 的 MCP 配置，由 host 自动拉起（无需手动执行上面这条命令）。
+   - **HTTP 模式（手工调试）**：
+     ```bash
+     python backend/bridge_server.py
+     ```
+     不依赖 `mcp` 包，可用系统自带 Python 直接跑。
+3. Agent 端按 `TOOL_REFERENCE.md` 的说明调用 Tool（MCP 模式走标准 `list_tools`/`call_tool`；HTTP 模式向 `http://127.0.0.1:8765/v1/call` 发起调用）。
 4. 保持 Chrome 内知网账号已登录；后续所有操作都在该浏览器可见标签中完成。
 
 ## 安全边界

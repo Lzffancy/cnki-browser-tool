@@ -1,6 +1,16 @@
 # CNKI 本地研究助手：Tool 使用说明
 
-本文件定义本机 Agent 可调用的受限 Tool。调用统一走本机桥接：
+本文件定义本机 Agent 可调用的受限 Tool。`backend/bridge_server.py` 支持两种调用方式，底层是同一个 `CommandBroker` 队列，只是 Agent 侧的协议不同：
+
+**方式一：MCP（推荐，`--mode mcp`）**
+
+```bash
+backend/.venv/Scripts/python.exe backend/bridge_server.py --mode mcp
+```
+
+以标准 MCP stdio server 运行，14 个动作逐一注册为具名 Tool（名字与下文一致，如 `search.sort`、`batch.start_pdf_download`），参数用 JSON Schema（枚举、长度、范围）在协议层校验，支持 Tool 发现（`list_tools`），不用再手搓 curl 拼 JSON。同一进程会在后台线程原样启一份 HTTP 服务专门伺候 Chrome 扩展的长轮询（见方式二），因为 MV3 Service Worker 没有 `listen()` 能力，这段传输方式不受协议选型影响。
+
+**方式二：裸 HTTP（`--mode http`，默认，向后兼容 / 手工调试）**
 
 ```text
 POST http://127.0.0.1:8765/v1/call
@@ -23,7 +33,11 @@ Content-Type: application/json
 }
 ```
 
+不依赖 `mcp` 包，可用系统自带 Python 直接跑，适合 curl 手工调试；扩展侧的轮询端点（`/v1/extension/next-command`、`/v1/extension/command-result`）在两种模式下行为完全一致。
+
 所有 Tool 均只会通过已登录 Chrome 内的 CNKI 页面执行。它们不会导出 Cookie、调用 CNKI 下载接口、启动无头浏览器、绕过验证码或权限控制。
+
+**参数命名对照**：下文各 Tool 的参数名是 HTTP `payload` 里的字段名（驼峰式，如 `sortBy`、`articleUrls`、`intervalSeconds`、`maxChars`）；MCP 模式下同一参数按 Python 习惯改成蛇形命名（`sort_by`、`article_urls`、`interval_seconds`、`max_chars`），语义、默认值、取值范围完全一致，只是命名风格不同。
 
 ## 推荐调用流程
 
@@ -359,3 +373,29 @@ search.submit("人工智能")
 2. Agent 只能使用上述命名 Tool，不可调用任意 JavaScript、CSS Selector、下载 URL 或浏览器 Cookie；
 3. 任何需要人类校验的登录、验证码、付费和权限提示，均由用户在 Chrome 中自行处理；
 4. 所有下载文件由 Chrome 的默认下载设置落盘；后续将单独增加“下载完成后的本地归档和元数据入库”模块。
+
+---
+
+## 6. MCP 模式环境准备
+
+`--mode mcp` 需要 `mcp` 包（本项目锁定 `mcp<2`，因为 2.x 把 `FastMCP` 改名成 `MCPServer` 且 API 结构变了，社区文档还没跟上）；`--mode http` 不需要任何第三方依赖，可直接用系统 Python 跑。
+
+```bash
+# 只需一次：为 MCP 模式建一个独立虚拟环境
+python -m venv backend/.venv
+backend/.venv/Scripts/pip install "mcp<2"
+
+# 之后每次启动 MCP 模式
+backend/.venv/Scripts/python.exe backend/bridge_server.py --mode mcp
+```
+
+把它注册进 Agent host 的 MCP 配置（例如 WorkBuddy 的 `~/.workbuddy/mcp.json`）后，由 host 负责拉起这个进程；不需要手动跑上面这条命令。
+
+---
+
+## 7. 版本变更记录
+
+- **0.7.1**：`download.recent` 从读取会被 MV3 Worker 重启清空的内存缓存，改为直接查询 `chrome.downloads.search`（见上文 `download.recent` 小节）。
+- **0.7.2**：删除 `service-worker.js` 中未被调用的死代码 `waitForDownloadCompletion`（及配套常量 `MAX_DOWNLOAD_COMPLETE_WAIT_MS`），不影响任何已有行为。
+- **0.2（backend）**：`bridge_server.py` 新增 `--mode mcp`，把 14 个动作注册为标准 MCP Tool（JSON Schema 校验 + Tool 发现），`--mode http` 保持原有行为不变；扩展侧协议与端点均未改动。
+

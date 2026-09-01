@@ -2,7 +2,6 @@ const BRIDGE_BASE_URL = "http://127.0.0.1:8765";
 const BRIDGE_ALARM = "cnki-local-bridge-poll";
 const TARGET_HOST_SUFFIX = ".cnki.net";
 const MAX_DOWNLOAD_WAIT_MS = 30_000;
-const MAX_DOWNLOAD_COMPLETE_WAIT_MS = 120_000;
 const MAX_RECENT_DOWNLOADS = 20;
 const MAX_BATCH_SIZE = 10;
 const DEFAULT_BATCH_INTERVAL_SECONDS = 5;
@@ -315,29 +314,6 @@ async function waitForNewDownload(startedAfter, timeoutMs = MAX_DOWNLOAD_WAIT_MS
     await sleep(500);
   }
   return null;
-}
-
-async function waitForDownloadCompletion(downloadId, timeoutMs = MAX_DOWNLOAD_COMPLETE_WAIT_MS) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const [item] = await chrome.downloads.search({ id: downloadId });
-    if (!item) {
-      return { completed: false, reason: "Chrome 未找到刚刚创建的下载任务。" };
-    }
-    rememberDownload(item);
-    if (item.state === "complete") {
-      return { completed: true, download: recentDownloads.find((entry) => entry.id === item.id) || item };
-    }
-    if (item.state === "interrupted") {
-      return {
-        completed: false,
-        reason: `下载已中断：${item.error || "未知原因"}。`,
-        download: recentDownloads.find((entry) => entry.id === item.id) || item
-      };
-    }
-    await sleep(700);
-  }
-  return { completed: false, reason: "等待浏览器下载完成超时。" };
 }
 
 async function submitCnkiSearchInTab(rawTab, query) {

@@ -1,13 +1,30 @@
 """本机 CNKI 插件桥接服务。
 
-服务仅监听 127.0.0.1。它不访问 CNKI，不保存 Cookie；只负责把本地 Tool 请求
-排队，并等待 Chrome 扩展返回用户已授权 CNKI 标签页中的页面数据。
-"""
+服务本身不访问 CNKI，不保存 Cookie；只负责把 Tool 请求排队，并等待 Chrome
+扩展返回用户已授权 CNKI 标签页中的页面数据。
 
-from __future__ import annotations
+支持两种运行模式（--mode）：
+
+- http（默认，向后兼容）：完整 HTTP 服务监听 127.0.0.1:<port>。
+  同时服务 Agent 侧调试用的 `/v1/call`，以及扩展侧轮询用的
+  `/v1/extension/next-command` / `/v1/extension/command-result`。
+  不依赖 mcp 包，可用系统自带 Python 直接跑，适合 curl 手工调试。
+
+- mcp：作为标准 MCP stdio server 运行，供支持 MCP 协议的 Agent host（如
+  WorkBuddy）通过 stdin/stdout 发现和调用 14 个具名 Tool，参数用
+  JSON Schema（枚举、范围、长度）在协议层做校验，不用再手搓 curl。
+  扩展侧仍然只认 HTTP 长轮询——Chrome MV3 Service Worker 没有 listen()
+  能力，这一段传输方式不受协议选型影响，因此本模式会在后台线程里原样
+  启一份 HTTP 服务专门伺候扩展（以及保留 `/v1/call` 供调试），主线程跑
+  MCP 的 stdio 事件循环。
+
+两种模式共享同一个 CommandBroker：不管 Agent 侧走 HTTP 还是 MCP，最终都是
+把动作放进同一个队列，等待同一个已登录 Chrome 扩展轮询取走并执行。
+"""
 
 import argparse
 import json
+import sys
 import threading
 import time
 import uuid
@@ -34,8 +51,9 @@ ALLOWED_ACTIONS = {
     "download.recent",
 }
 MAX_CALL_TIMEOUT_SECONDS = 45
+DEFAULT_MCP_CALL_TIMEOUT_SECONDS = 40
 
-# Tool 元数据同时服务于 /health 自描述接口和后续 Agent 的 Tool 注册。
+# Tool 元数据同时服务于 /health 自描述接口和 MCP Tool 注册。
 # 这里只允许列出受限、可审计的业务动作，禁止扩展为任意 JS 或任意选择器点击。
 TOOL_DESCRIPTIONS: dict[str, dict[str, Any]] = {
     "session.status": {
@@ -59,7 +77,7 @@ TOOL_DESCRIPTIONS: dict[str, dict[str, Any]] = {
         "payload": {"url": "必填，https://*.cnki.net/*"},
     },
     "search.submit": {
-        "description": "自动创建或复用 CNKI 检索页，在页面检索框中输入关键词并点击原生检索按钮。",
+        "description": "自动创建或复用 CNKI 检索页，在页面检索框中输入关键词并点击页面原生检索按钮。",
         "payload": {"query": "必填，1-100 字检索词"},
     },
     "search.sort": {
@@ -94,8 +112,8 @@ TOOL_DESCRIPTIONS: dict[str, dict[str, Any]] = {
         "payload": {},
     },
     "download.recent": {
-        "description": "查询插件运行期间 Chrome 最近创建或更新的下载任务。",
-        "payload": {},
+        "description": "查询 Chrome 下载历史中最近创建或更新的下载任务（实时查询，不依赖插件内存缓存）。",
+        "payload": {"limit": "可选，1-50，默认 20"},
     },
 }
 
@@ -168,10 +186,10 @@ BROKER = CommandBroker()
 
 
 class BridgeRequestHandler(BaseHTTPRequestHandler):
-    server_version = "CnkiLocalBridge/0.1"
+    server_version = "CnkiLocalBridge/0.2"
 
     def log_message(self, format: str, *args: Any) -> None:
-        print(f"[{self.log_date_time_string()}] {format % args}")
+        print(f"[{self.log_date_time_string()}] {format % args}", file=sys.stderr)
 
     def _read_json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0"))
@@ -297,12 +315,196 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         self._not_found()
 
 
+def run_bridge_action(action: str, payload: dict[str, Any], timeout_seconds: int = DEFAULT_MCP_CALL_TIMEOUT_SECONDS) -> Any:
+    """把一次 Tool 调用放进队列并同步等待扩展执行结果。
+
+    供 MCP Tool 处理函数复用；成功返回 `completed.result`，失败/超时抛出
+    RuntimeError，交由调用方（MCP 框架）转换成协议层的错误响应。
+    """
+    if action not in ALLOWED_ACTIONS:
+        raise RuntimeError(f"不支持的 Tool：{action}。")
+    bounded_timeout = min(max(int(timeout_seconds), 1), MAX_CALL_TIMEOUT_SECONDS)
+    command = BROKER.enqueue(action, payload)
+    completed = BROKER.wait_for_result(command, bounded_timeout)
+    if not completed.completed:
+        raise RuntimeError(
+            "等待插件响应超时。请确认 Chrome 已加载插件、CNKI 页面已授权，并等待下一次轮询。"
+        )
+    if completed.error:
+        raise RuntimeError(completed.error)
+    return completed.result
+
+
+def build_mcp_server() -> Any:
+    """构建一个 MCP stdio server，把 14 个受限动作注册为具名 Tool。
+
+    每个 Tool 的参数用类型标注 + pydantic Field 表达枚举、长度、范围约束，
+    由 MCP 框架在协议层生成 JSON Schema 并校验，出错不用再等扩展报错。
+    lazy import：只有 --mode mcp 时才需要 mcp 依赖，--mode http 调试时
+    仍可用系统自带 Python 直接跑，不强制安装额外依赖。
+    """
+    from typing import Annotated, Literal
+
+    from mcp.server.fastmcp import FastMCP
+    from pydantic import Field
+
+    mcp = FastMCP(
+        name="cnki-local-bridge",
+        instructions=(
+            "通过用户已登录 Chrome 内可见的 CNKI 页面执行受限读取、导航和正常下载点击。"
+            "不导出 Cookie、不调用 CNKI 下载或检索接口、不启动无头浏览器、不绕过验证码或权限控制。"
+            "推荐调用顺序：session.status -> session.open_search/search.submit -> search.results "
+            "-> (可选 search.sort) -> 按业务规则筛选 articleUrl -> batch.start_pdf_download "
+            "-> batch.get_status -> 仅在用户处理了页面阻塞后才调用 batch.resume_pdf_download。"
+        ),
+    )
+
+    @mcp.tool(name="session.status", description=TOOL_DESCRIPTIONS["session.status"]["description"])
+    def session_status() -> Any:
+        return run_bridge_action("session.status", {})
+
+    @mcp.tool(name="session.open_search", description=TOOL_DESCRIPTIONS["session.open_search"]["description"])
+    def session_open_search(
+        query: Annotated[
+            str,
+            Field(default="", max_length=100, description="检索词；留空则只打开检索页，不执行检索。"),
+        ] = "",
+    ) -> Any:
+        return run_bridge_action("session.open_search", {"query": query})
+
+    @mcp.tool(name="page.snapshot", description=TOOL_DESCRIPTIONS["page.snapshot"]["description"])
+    def page_snapshot() -> Any:
+        return run_bridge_action("page.snapshot", {})
+
+    @mcp.tool(name="page.dom", description=TOOL_DESCRIPTIONS["page.dom"]["description"])
+    def page_dom(
+        max_chars: Annotated[
+            int,
+            Field(default=120000, ge=1000, le=300000, description="返回 HTML 的最大字符数。"),
+        ] = 120000,
+    ) -> Any:
+        return run_bridge_action("page.dom", {"maxChars": max_chars})
+
+    @mcp.tool(name="page.navigate", description=TOOL_DESCRIPTIONS["page.navigate"]["description"])
+    def page_navigate(
+        url: Annotated[
+            str,
+            Field(
+                min_length=1,
+                max_length=1000,
+                pattern=r"^https://([A-Za-z0-9-]+\.)*cnki\.net/",
+                description="仅接受 https://cnki.net/* 或 https://*.cnki.net/* 页面地址。",
+            ),
+        ],
+    ) -> Any:
+        return run_bridge_action("page.navigate", {"url": url})
+
+    @mcp.tool(name="search.submit", description=TOOL_DESCRIPTIONS["search.submit"]["description"])
+    def search_submit(
+        query: Annotated[
+            str,
+            Field(min_length=1, max_length=100, description="检索关键词。"),
+        ],
+    ) -> Any:
+        return run_bridge_action("search.submit", {"query": query})
+
+    @mcp.tool(name="search.sort", description=TOOL_DESCRIPTIONS["search.sort"]["description"])
+    def search_sort(
+        sort_by: Annotated[
+            Literal["citations", "downloads", "relevance", "publishedAt", "comprehensive"],
+            Field(description="citations=被引，downloads=下载，relevance=相关度，publishedAt=发表时间，comprehensive=综合。"),
+        ],
+        limit: Annotated[
+            int,
+            Field(default=20, ge=1, le=50, description="排序刷新后返回多少条结果。"),
+        ] = 20,
+    ) -> Any:
+        return run_bridge_action("search.sort", {"sortBy": sort_by, "limit": limit})
+
+    @mcp.tool(name="search.results", description=TOOL_DESCRIPTIONS["search.results"]["description"])
+    def search_results(
+        limit: Annotated[
+            int,
+            Field(default=20, ge=1, le=50, description="返回结果条数。"),
+        ] = 20,
+    ) -> Any:
+        return run_bridge_action("search.results", {"limit": limit})
+
+    @mcp.tool(name="article.download_options", description=TOOL_DESCRIPTIONS["article.download_options"]["description"])
+    def article_download_options() -> Any:
+        return run_bridge_action("article.download_options", {})
+
+    @mcp.tool(name="article.click_pdf_download", description=TOOL_DESCRIPTIONS["article.click_pdf_download"]["description"])
+    def article_click_pdf_download() -> Any:
+        return run_bridge_action("article.click_pdf_download", {})
+
+    @mcp.tool(name="batch.start_pdf_download", description=TOOL_DESCRIPTIONS["batch.start_pdf_download"]["description"])
+    def batch_start_pdf_download(
+        article_urls: Annotated[
+            list[str],
+            Field(min_length=1, max_length=10, description="1-10 个 CNKI 论文详情页 URL，不能是下载接口地址；重复会被去重。"),
+        ],
+        interval_seconds: Annotated[
+            int,
+            Field(default=5, ge=3, le=30, description="每篇之间的最短间隔秒数。"),
+        ] = 5,
+    ) -> Any:
+        return run_bridge_action(
+            "batch.start_pdf_download",
+            {"articleUrls": article_urls, "intervalSeconds": interval_seconds},
+        )
+
+    @mcp.tool(name="batch.get_status", description=TOOL_DESCRIPTIONS["batch.get_status"]["description"])
+    def batch_get_status() -> Any:
+        return run_bridge_action("batch.get_status", {})
+
+    @mcp.tool(name="batch.resume_pdf_download", description=TOOL_DESCRIPTIONS["batch.resume_pdf_download"]["description"])
+    def batch_resume_pdf_download() -> Any:
+        return run_bridge_action("batch.resume_pdf_download", {})
+
+    @mcp.tool(name="download.recent", description=TOOL_DESCRIPTIONS["download.recent"]["description"])
+    def download_recent(
+        limit: Annotated[
+            int,
+            Field(default=20, ge=1, le=50, description="返回最近多少条 Chrome 下载历史记录。"),
+        ] = 20,
+    ) -> Any:
+        return run_bridge_action("download.recent", {"limit": limit})
+
+    return mcp
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="启动 CNKI Chrome 插件本地桥接服务")
     parser.add_argument("--port", type=int, default=8765, help="本机监听端口，默认 8765")
+    parser.add_argument(
+        "--mode",
+        choices=["http", "mcp"],
+        default="http",
+        help="http：完整 HTTP 服务（默认，兼容 curl 调试）；mcp：MCP stdio server，同时在后台线程为扩展保留 HTTP 长轮询。",
+    )
     args = parser.parse_args()
 
     server = ThreadingHTTPServer(("127.0.0.1", args.port), BridgeRequestHandler)
+
+    if args.mode == "mcp":
+        # stdio 模式下 stdout 是 MCP JSON-RPC 帧的专用通道，任何多余的 print
+        # 都会打坏协议流，所以这里的日志全部走 stderr。
+        print(f"[cnki-local-bridge] HTTP 服务已在后台线程启动：http://127.0.0.1:{args.port}", file=sys.stderr)
+        print("[cnki-local-bridge] 仅供 Chrome 扩展轮询及本机调试；服务不访问 CNKI，也不保存 Cookie。", file=sys.stderr)
+        http_thread = threading.Thread(target=server.serve_forever, name="bridge-http", daemon=True)
+        http_thread.start()
+        try:
+            mcp_app = build_mcp_server()
+            print("[cnki-local-bridge] MCP stdio server 已启动，等待 Agent host 连接…", file=sys.stderr)
+            mcp_app.run(transport="stdio")
+        except KeyboardInterrupt:
+            pass
+        finally:
+            server.shutdown()
+            server.server_close()
+        return
+
     print(f"CNKI 本地桥接服务已启动：http://127.0.0.1:{args.port}")
     print("仅接受本机访问；服务不访问 CNKI，也不保存 Cookie。按 Ctrl+C 停止。")
     try:

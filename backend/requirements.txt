@@ -1,0 +1,4 @@
+# 仅 --mode mcp 需要；--mode http（默认）不依赖任何第三方包。
+# 锁定 mcp<2：mcp 2.x 把 FastMCP 重命名为 MCPServer 且 API 结构变化较大，
+# 生态文档/示例还没跟上，1.x 的 FastMCP 装饰器风格更稳定、更适合当前用法。
+mcp<2
