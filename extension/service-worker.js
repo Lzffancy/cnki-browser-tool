@@ -1,6 +1,7 @@
 const BRIDGE_BASE_URL = "http://127.0.0.1:8765";
 const BRIDGE_ALARM = "cnki-local-bridge-poll";
 const TARGET_HOST_SUFFIX = ".cnki.net";
+// 仅作为下面“下载是否已开始”检测的兜底超时阈值，不再是一段裸 while+sleep 的忙等时长。
 const MAX_DOWNLOAD_WAIT_MS = 30_000;
 const MAX_RECENT_DOWNLOADS = 20;
 const MAX_BATCH_SIZE = 10;
@@ -11,6 +12,14 @@ const BATCH_STORAGE_KEY = "pdfDownloadBatch";
 const BATCH_STEP_ALARM = "cnki-pdf-batch-step";
 const BATCH_STEP_MIN_DELAY_MS = 30_000;
 const BATCH_DOWNLOAD_TIMEOUT_MS = 180_000;
+// 单篇/批次点击 PDF 下载按钮后，等待 Chrome 创建下载任务这一步的持久化状态。
+// 用 chrome.downloads.onCreated 真实事件 + chrome.alarms 兜底超时推进，
+// 不再用 while+sleep 忙等（原因见 triggerPdfDownloadOnTab 内注释）。
+const DOWNLOAD_WAIT_STORAGE_KEY = "pendingPdfDownloadWait";
+const DOWNLOAD_WAIT_ALARM = "cnki-pdf-download-wait-timeout";
+// executeBridgeCommand/processNextPdfBatchItem 用这个哨兵区分“已经有明确结果”
+// 和“结果会在下载事件或超时 alarm 触发后异步提交”，避免重复提交。
+const PENDING_ASYNC_RESULT = Symbol("pending-async-download-result");
 const CONTENT_SCRIPT_VERSION = "0.7.0";
 const SEARCH_HOME_URL = "https://kns.cnki.net/kns8s/defaultresult/index";
 
@@ -102,7 +111,101 @@ async function getRecentDownloadsLive(limit) {
   return items.map(summarizeDownload);
 }
 
-chrome.downloads.onCreated.addListener(rememberDownload);
+function findDownloadSince(candidates, startedAfter) {
+  return candidates.find((item) => {
+    const start = new Date(item.startTime).getTime();
+    return Number.isFinite(start) && start >= startedAfter - 1_000;
+  });
+}
+
+async function getDownloadWaitState() {
+  const stored = await chrome.storage.local.get(DOWNLOAD_WAIT_STORAGE_KEY);
+  return stored[DOWNLOAD_WAIT_STORAGE_KEY] || null;
+}
+
+async function saveDownloadWaitState(state) {
+  await chrome.storage.local.set({ [DOWNLOAD_WAIT_STORAGE_KEY]: state });
+}
+
+async function clearDownloadWaitState() {
+  await chrome.storage.local.remove(DOWNLOAD_WAIT_STORAGE_KEY);
+  await chrome.alarms.clear(DOWNLOAD_WAIT_ALARM);
+}
+
+// 无论是被 chrome.downloads.onCreated 真实事件触发，还是被兜底 alarm 超时触发，
+// 都走这一个函数收尾：按等待来源（单次 Tool 调用 / 批次某一篇）分别推进结果，
+// 保证两条触发路径不会重复处理同一个等待状态。
+async function resolveDownloadWait(wait, download) {
+  await clearDownloadWaitState();
+  const detected = Boolean(download);
+  const summarized = detected ? summarizeDownload(download) : null;
+
+  if (wait.source === "command") {
+    await submitBridgeResult(wait.commandId, {
+      ...wait.clickResult,
+      downloadDetected: detected,
+      download: summarized
+    });
+    return;
+  }
+
+  // wait.source === "batch"：继续推进批次里当前这一篇的状态。
+  const batch = await getBatchState();
+  if (!batch || batch.state !== "running" || batch.currentIndex >= batch.items.length) {
+    return;
+  }
+  const item = batch.items[batch.currentIndex];
+  if (item.state !== "waiting_pdf_download") {
+    return;
+  }
+  if (!detected) {
+    await pauseBatch(batch, item, "已点击 PDF 下载按钮，但 Chrome 未在 30 秒内创建下载任务；可能需要用户在页面处理权限、登录或验证码。");
+    return;
+  }
+  item.state = "downloading";
+  item.download = summarized;
+  item.downloadStartedAt = new Date().toISOString();
+  batch.updatedAt = item.downloadStartedAt;
+  await saveBatchState(batch);
+  await scheduleBatchStep(BATCH_STEP_MIN_DELAY_MS);
+}
+
+async function handleDownloadWaitTimeout() {
+  const wait = await getDownloadWaitState();
+  if (!wait) {
+    return;
+  }
+  const candidates = await chrome.downloads.search({ orderBy: ["-startTime"], limit: 10 });
+  const found = findDownloadSince(candidates, wait.startedAfter);
+  if (found) {
+    rememberDownload(found);
+  }
+  await resolveDownloadWait(wait, found || null);
+}
+
+// Service Worker 重启后主动核实一次：如果等待期间下载事件恰好发生在 Worker
+// 不在线的瞬间，这里用 chrome.downloads.search 兜底找回，不必等 alarm 到期。
+// 没找到也不清理状态——留给已经持久化的 DOWNLOAD_WAIT_ALARM 到期后判定为未检测到。
+async function reconcileDownloadWaitOnStartup() {
+  const wait = await getDownloadWaitState();
+  if (!wait) {
+    return;
+  }
+  const candidates = await chrome.downloads.search({ orderBy: ["-startTime"], limit: 10 });
+  const found = findDownloadSince(candidates, wait.startedAfter);
+  if (found) {
+    rememberDownload(found);
+    await resolveDownloadWait(wait, found);
+  }
+}
+
+chrome.downloads.onCreated.addListener(async (downloadItem) => {
+  rememberDownload(downloadItem);
+  const wait = await getDownloadWaitState();
+  if (wait && findDownloadSince([downloadItem], wait.startedAfter)) {
+    await resolveDownloadWait(wait, downloadItem);
+  }
+});
 chrome.downloads.onChanged.addListener(async (delta) => {
   if (!delta?.id) {
     return;
@@ -164,12 +267,34 @@ async function advanceBatchFromDownloadEvent(download) {
   }
 }
 
-async function getActiveCnkiTab() {
-  const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-  if (!activeTab?.id || !isCnkiPage(activeTab.url ?? "")) {
-    throw new Error("未找到当前活动的 CNKI 页面。请先通过 session.open_search 创建检索页，或在 Chrome 中打开知网。");
+// 定位一个可用的 CNKI 标签页，不再要求它必须是“当前活动标签”。
+// 优先级：指定 tabId（批次流程固定复用同一 tab）> 当前活动标签（若是 CNKI）>
+// 任意一个已打开的 CNKI 标签页。content script 的 DOM 操作与消息驱动都不依赖
+// 窗口是否可见、标签是否处于活动状态，因此用户切走焦点、切到别的窗口都不应中断流程。
+async function getPreferredCnkiTab(preferredTabId = null) {
+  if (preferredTabId != null) {
+    try {
+      const tab = await chrome.tabs.get(preferredTabId);
+      if (tab?.id && isCnkiPage(tab.url ?? "")) {
+        return tab;
+      }
+    } catch {
+      // 指定的 tab 已关闭或不可访问，继续向下寻找其他 CNKI 标签页。
+    }
   }
-  return activeTab;
+
+  const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  if (activeTab?.id && isCnkiPage(activeTab.url ?? "")) {
+    return activeTab;
+  }
+
+  const cnkiTabs = await chrome.tabs.query({ url: ["https://cnki.net/*", "https://*.cnki.net/*"] });
+  const usable = cnkiTabs.filter((tab) => tab?.id != null);
+  if (usable.length > 0) {
+    return usable[0];
+  }
+
+  throw new Error("未找到可用的 CNKI 页面。请先通过 session.open_search 创建检索页，或在 Chrome 中打开知网。");
 }
 
 async function getOrCreateCnkiTab() {
@@ -225,7 +350,7 @@ async function readPage(tab, messageType, options = {}) {
 }
 
 async function getActiveCnkiPage() {
-  const tab = await getActiveCnkiTab();
+  const tab = await getPreferredCnkiTab();
   const snapshot = await readPage(tab, CNKI_MESSAGE.GET_PAGE_SNAPSHOT);
   return { ok: true, data: snapshot };
 }
@@ -299,23 +424,6 @@ async function openSearchPage(payload) {
   return submitCnkiSearchInTab(tab, query);
 }
 
-async function waitForNewDownload(startedAfter, timeoutMs = MAX_DOWNLOAD_WAIT_MS) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const candidates = await chrome.downloads.search({ orderBy: ["-startTime"], limit: 10 });
-    const found = candidates.find((item) => {
-      const start = new Date(item.startTime).getTime();
-      return Number.isFinite(start) && start >= startedAfter - 1_000;
-    });
-    if (found) {
-      rememberDownload(found);
-      return recentDownloads.find((item) => item.id === found.id) || found;
-    }
-    await sleep(500);
-  }
-  return null;
-}
-
 async function submitCnkiSearchInTab(rawTab, query) {
   let tab = rawTab;
   if (!new URL(tab.url).pathname.includes("/kns8s/")) {
@@ -368,7 +476,7 @@ async function sortCnkiSearchResults(payload) {
   if (!sortBy) {
     throw new Error("缺少排序字段 sortBy。");
   }
-  const tab = await getActiveCnkiTab();
+  const tab = await getPreferredCnkiTab();
   const before = await readPage(tab, CNKI_MESSAGE.GET_SEARCH_RESULTS, { limit: 10 });
   const submitted = await readPage(tab, CNKI_MESSAGE.SORT_SEARCH_RESULTS, { sortBy });
   const beforeSignature = resultSignature(before);
@@ -385,18 +493,42 @@ async function sortCnkiSearchResults(payload) {
 }
 
 async function getSearchResults(payload) {
-  const tab = await getActiveCnkiTab();
+  const tab = await getPreferredCnkiTab();
   return readPage(tab, CNKI_MESSAGE.GET_SEARCH_RESULTS, { limit: payload?.limit });
 }
 
-async function triggerPdfDownloadOnTab(tab) {
+// options.commandId 存在时表示这是单次 article.click_pdf_download Tool 调用
+// （source 固定为 "command"，结果要回传给对应的桥接 commandId）；
+// 批次流程调用时不传 commandId，source 为 "batch"。
+async function triggerPdfDownloadOnTab(tab, options = {}) {
+  const commandId = options.commandId || null;
+  const source = commandId ? "command" : "batch";
   const startedAt = Date.now();
   const clickResult = await readPage(tab, CNKI_MESSAGE.CLICK_PDF_DOWNLOAD);
   if (!clickResult.clicked) {
-    return { ...clickResult, downloadDetected: false };
+    return { ...clickResult, downloadDetected: false, download: null };
   }
-  const download = await waitForNewDownload(startedAt);
-  return { ...clickResult, downloadDetected: Boolean(download), download };
+
+  // 点击到 Chrome 创建下载任务通常在几百毫秒内完成，先同步核实一次，
+  // 多数情况可以直接返回，不需要进入下面的异步等待路径。
+  const quick = await chrome.downloads.search({ orderBy: ["-startTime"], limit: 5 });
+  const immediate = findDownloadSince(quick, startedAt);
+  if (immediate) {
+    rememberDownload(immediate);
+    return { ...clickResult, downloadDetected: true, download: summarizeDownload(immediate) };
+  }
+
+  // 不再用 while + sleep 阻塞等待最长 30 秒——MV3 Service Worker 在这段纯计时器
+  // 等待期间可能被 Chrome 判定为空闲并直接终止：一旦被杀，点击可能已经成功、
+  // 下载可能已经真的开始了，但提交结果的代码永远不会被执行到，桥接服务只能等到
+  // 自己的超时报错，表现为"插件其实成功了，服务却说不知道"（与之前修复的
+  // download.recent 内存缓存问题同类，也是批次下载早前踩过的坑）。
+  // 改为把等待状态持久化到 chrome.storage.local，靠 chrome.downloads.onCreated
+  // 真实事件和 chrome.alarms 兜底超时来推进——这两者都能在 Worker 被终止后
+  // 重新唤醒并继续把结果提交出去。
+  await saveDownloadWaitState({ source, commandId, startedAfter: startedAt, clickResult });
+  await chrome.alarms.create(DOWNLOAD_WAIT_ALARM, { when: Date.now() + MAX_DOWNLOAD_WAIT_MS });
+  return PENDING_ASYNC_RESULT;
 }
 
 function normalizeBatchInput(payload) {
@@ -435,7 +567,7 @@ async function startPdfBatch(payload) {
   if (current?.state === "running") {
     throw new Error(`已有下载批次正在执行：${current.batchId}。请等待完成或暂停后再创建新批次。`);
   }
-  const tab = await getActiveCnkiTab();
+  const tab = await getPreferredCnkiTab();
   const batch = {
     batchId: createBatchId(),
     state: "running",
@@ -496,6 +628,13 @@ async function processNextPdfBatchItem() {
     return;
   }
 
+  if (item.state === "waiting_pdf_download") {
+    // 这一篇“点击后等待下载开始”的检测已经交给持久化的 DOWNLOAD_WAIT_ALARM 和
+    // chrome.downloads.onCreated 事件（见 resolveDownloadWait）独立推进，这里
+    // 什么都不做，避免和它们竞态触发重复点击。
+    return;
+  }
+
   // Worker 在页面动作完成前休眠时，下一次 alarm 从该状态重新处理当前篇；
   // 尚未记录下载任务时不会跳到下一篇，避免遗漏。
   item.state = "opening_detail";
@@ -504,7 +643,17 @@ async function processNextPdfBatchItem() {
   await saveBatchState(batch);
 
   try {
-    const tab = await navigateCnkiTab(batch.tabId, item.articleUrl);
+    let tab;
+    try {
+      tab = await navigateCnkiTab(batch.tabId, item.articleUrl);
+    } catch (navError) {
+      // 批次启动时记录的 tab 可能已被用户关闭；重新定位一个可用的 CNKI 标签页
+      // 继续当前篇，并回写 batch.tabId，避免后续每一篇都重试同一个失效的 tab。
+      tab = await getPreferredCnkiTab();
+      batch.tabId = tab.id;
+      await saveBatchState(batch);
+      tab = await navigateCnkiTab(tab.id, item.articleUrl);
+    }
     const snapshot = await readPage(tab, CNKI_MESSAGE.GET_PAGE_SNAPSHOT);
     item.title = snapshot.title.replace(/\s*-\s*中国知网\s*$/, "").trim() || null;
     item.state = "waiting_pdf_download";
@@ -512,6 +661,11 @@ async function processNextPdfBatchItem() {
     await saveBatchState(batch);
 
     const result = await triggerPdfDownloadOnTab(tab);
+    if (result === PENDING_ASYNC_RESULT) {
+      // 下载是否已开始会由 chrome.downloads.onCreated 事件或 DOWNLOAD_WAIT_ALARM
+      // 超时兜底异步判定（见 resolveDownloadWait），这里不再往下走。
+      return;
+    }
     if (!result.clicked) {
       throw new Error(result.reason || "未找到 PDF 下载按钮。");
     }
@@ -556,11 +710,11 @@ async function resumePdfBatch() {
 async function executeBridgeCommand(command) {
   switch (command.action) {
     case "page.snapshot": {
-      const tab = await getActiveCnkiTab();
+      const tab = await getPreferredCnkiTab();
       return readPage(tab, CNKI_MESSAGE.GET_PAGE_SNAPSHOT);
     }
     case "page.dom": {
-      const tab = await getActiveCnkiTab();
+      const tab = await getPreferredCnkiTab();
       return readPage(tab, CNKI_MESSAGE.GET_PAGE_DOM, { maxChars: command.payload?.maxChars });
     }
     case "page.navigate":
@@ -576,12 +730,12 @@ async function executeBridgeCommand(command) {
     case "search.results":
       return getSearchResults(command.payload);
     case "article.download_options": {
-      const tab = await getActiveCnkiTab();
+      const tab = await getPreferredCnkiTab();
       return readPage(tab, CNKI_MESSAGE.GET_DOWNLOAD_OPTIONS);
     }
     case "article.click_pdf_download": {
-      const tab = await getActiveCnkiTab();
-      return triggerPdfDownloadOnTab(tab);
+      const tab = await getPreferredCnkiTab();
+      return triggerPdfDownloadOnTab(tab, { commandId: command.id });
     }
     case "batch.start_pdf_download":
       return startPdfBatch(command.payload);
@@ -626,6 +780,11 @@ async function pollLocalBridge() {
     const command = await response.json();
     try {
       const result = await executeBridgeCommand(command);
+      if (result === PENDING_ASYNC_RESULT) {
+        // 该 Tool 调用的结果会在下载事件或等待超时触发后异步提交（见
+        // resolveDownloadWait），这里不重复提交，避免竞态。
+        return;
+      }
       await submitBridgeResult(command.id, result);
     } catch (error) {
       await submitBridgeError(command.id, error);
@@ -646,6 +805,7 @@ function scheduleBridgePolling() {
   chrome.alarms.create(BRIDGE_ALARM, { periodInMinutes: 0.5 });
   void pollLocalBridge();
   void resumeStoredBatch();
+  void reconcileDownloadWaitOnStartup();
 }
 
 chrome.runtime.onInstalled.addListener(async () => {
@@ -667,6 +827,10 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }
   if (alarm.name === BATCH_STEP_ALARM) {
     void processNextPdfBatchItem();
+    return;
+  }
+  if (alarm.name === DOWNLOAD_WAIT_ALARM) {
+    void handleDownloadWaitTimeout();
   }
 });
 

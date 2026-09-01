@@ -25,7 +25,7 @@ extension/content/cnki-page.js   注入到 CNKI 页面的内容脚本，读取 D
 
 - **backend/bridge_server.py**：本机桥接服务，把 Agent 的 Tool 调用转发给扩展，是唯一暴露给 Agent 的入口。支持两种模式：`--mode mcp`（标准 MCP stdio server，14 个动作注册为具名 Tool，JSON Schema 校验参数）和 `--mode http`（默认，裸 HTTP，兼容 curl 手工调试）。两种模式下，扩展侧看到的都是同一套 HTTP 长轮询端点——Chrome MV3 Service Worker 没有 `listen()` 能力，这段传输方式不受 Agent 侧协议选型影响。
 - **extension/**：Chrome MV3 扩展本体。
-  - `service-worker.js`：调度中心，处理会话状态、检索、批量下载队列，用 `chrome.alarms` + `chrome.storage.local` 解决 Service Worker 休眠导致的批次中断问题。
+  - `service-worker.js`：调度中心，处理会话状态、检索、批量下载队列，用 `chrome.alarms` + `chrome.storage.local` 解决 Service Worker 休眠导致的批次中断问题；单篇/批次里"点击后等待下载开始"这一步同样用 `chrome.downloads.onCreated` 真实事件 + `chrome.alarms` 兜底超时异步完成，不用裸计时器阻塞等待。
   - `content/cnki-page.js`：注入到知网页面的内容脚本，负责解析检索结果、点击详情页下载按钮等页面级操作。
   - `popup/`：扩展弹窗界面，用于查看状态和手动触发操作。
 - **TOOL_REFERENCE.md**：完整的 Tool 调用说明（每个 action 的参数、返回值、限制条件），Agent 接入前必读。

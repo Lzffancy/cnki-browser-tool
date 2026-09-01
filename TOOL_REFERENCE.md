@@ -274,6 +274,8 @@ search.submit("人工智能")
 
 **暂停边界**：若页面提示登录、验证码、权限不足、下载弹窗要求人工确认，Tool 只返回状态，不处理或绕过。
 
+**实现说明（0.7.3+）**：点击后不再用裸计时器阻塞等待最长 30 秒——那样做会让 MV3 Service Worker 在等待期间可能被 Chrome 判定为空闲并终止，导致下载其实已经开始却永远没有结果回传（表现为桥接服务超时报错，即使 Chrome 里下载已经成功）。现在改为：点击后先做一次即时核实；如果没有立刻查到新下载，就把等待状态持久化，靠 `chrome.downloads.onCreated` 真实事件和 `chrome.alarms` 兜底超时来异步推进并把结果提交回桥接服务，两者都能在 Worker 被系统回收后重新唤醒继续处理。批次下载中“点击后等待下载开始”这一步用的是同一套机制。
+
 ---
 
 ## 4. 批量 PDF 下载 Tool
@@ -397,5 +399,7 @@ backend/.venv/Scripts/python.exe backend/bridge_server.py --mode mcp
 
 - **0.7.1**：`download.recent` 从读取会被 MV3 Worker 重启清空的内存缓存，改为直接查询 `chrome.downloads.search`（见上文 `download.recent` 小节）。
 - **0.7.2**：删除 `service-worker.js` 中未被调用的死代码 `waitForDownloadCompletion`（及配套常量 `MAX_DOWNLOAD_COMPLETE_WAIT_MS`），不影响任何已有行为。
+- **0.7.3**：修复 `article.click_pdf_download`（及批次下载内“点击后等待下载开始”这一步）里长达 30 秒的裸 `while + setTimeout` 轮询：改为点击后先做一次即时核实，未命中则把等待状态持久化到 `chrome.storage.local`，由 `chrome.downloads.onCreated` 真实事件和 `chrome.alarms` 兜底超时异步推进结果，避免 MV3 Service Worker 在裸计时器等待期间被系统终止导致"下载其实成功了，但桥接服务只等到超时"。
+- **0.7.4**：把 CNKI 标签定位从「必须是当前活动标签」放宽为「存在任意可用 CNKI 标签即可」。`service-worker.js` 新增 `getPreferredCnkiTab(preferredTabId)`，按「指定 tabId > 当前活动标签（若是 CNKI）> 任意已打开的 CNKI 标签」三级回退，替换原 `getActiveCnkiTab` 的全部调用；批次运行本就复用固定 `tabId`，这里顺带为批次增加该 tab 被关闭后的自动重定位兜底。效果：下载/检索期间切到别的标签或窗口不再中断，只有电脑睡眠/锁屏、或所有 CNKI 标签被关闭时才会暂停。
 - **0.2（backend）**：`bridge_server.py` 新增 `--mode mcp`，把 14 个动作注册为标准 MCP Tool（JSON Schema 校验 + Tool 发现），`--mode http` 保持原有行为不变；扩展侧协议与端点均未改动。
 

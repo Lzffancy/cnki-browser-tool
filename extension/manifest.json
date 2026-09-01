@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "CNKI 本地研究助手",
-  "version": "0.7.2",
+  "version": "0.7.4",
   "description": "供本机研究 Agent 在用户已登录的 CNKI 页面内执行受限读取、导航和正常下载点击；数据仅在本机插件与本机服务之间传递。",
   "permissions": ["storage", "tabs", "alarms", "scripting", "downloads"],
   "host_permissions": [
