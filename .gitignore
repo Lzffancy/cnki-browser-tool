@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Debug / captured page dumps (large, may contain scraped page content)
+*-dom.json
+current-search-dom.json
+search-page-dom.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/

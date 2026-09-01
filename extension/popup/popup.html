@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CNKI 本地研究助手</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main>
+      <h1>CNKI 页面读取</h1>
+      <p class="hint">本机 Agent 自动读取 Chrome 当前活动的 CNKI 标签页；不读取或导出登录 Cookie。</p>
+      <button id="read-page" type="button">读取当前页面</button>
+      <p id="status" class="status" aria-live="polite">等待操作</p>
+      <p class="hint">本地服务当前仅调用“页面快照”和“受限 DOM 读取”两个 Tool；此版本不会点击、搜索或下载。</p>
+      <section id="result" class="result" hidden>
+        <dl>
+          <div><dt>标题</dt><dd id="page-title"></dd></div>
+          <div><dt>地址</dt><dd id="page-url"></dd></div>
+          <div><dt>状态</dt><dd id="page-ready-state"></dd></div>
+          <div><dt>正文长度</dt><dd id="page-text-length"></dd></div>
+        </dl>
+        <h2>页面正文预览</h2>
+        <pre id="page-preview"></pre>
+      </section>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>
