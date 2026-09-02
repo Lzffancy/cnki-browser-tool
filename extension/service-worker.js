@@ -20,7 +20,7 @@ const DOWNLOAD_WAIT_ALARM = "cnki-pdf-download-wait-timeout";
 // executeBridgeCommand/processNextPdfBatchItem 用这个哨兵区分“已经有明确结果”
 // 和“结果会在下载事件或超时 alarm 触发后异步提交”，避免重复提交。
 const PENDING_ASYNC_RESULT = Symbol("pending-async-download-result");
-const CONTENT_SCRIPT_VERSION = "0.7.0";
+const CONTENT_SCRIPT_VERSION = "0.7.8";
 const SEARCH_HOME_URL = "https://kns.cnki.net/kns8s/defaultresult/index";
 
 const CNKI_MESSAGE = {
@@ -30,6 +30,12 @@ const CNKI_MESSAGE = {
   SUBMIT_SEARCH: "CNKI_SUBMIT_SEARCH",
   SORT_SEARCH_RESULTS: "CNKI_SORT_SEARCH_RESULTS",
   GET_SEARCH_RESULTS: "CNKI_GET_SEARCH_RESULTS",
+  SET_SEARCH_FIELD: "CNKI_SET_SEARCH_FIELD",
+  SET_LIBRARY: "CNKI_SET_LIBRARY",
+  TURN_PAGE: "CNKI_TURN_PAGE",
+  GET_FILTERS: "CNKI_GET_FILTERS",
+  APPLY_FILTER: "CNKI_APPLY_FILTER",
+  SUBMIT_ADVANCED_SEARCH: "CNKI_SUBMIT_ADVANCED_SEARCH",
   GET_DOWNLOAD_OPTIONS: "CNKI_GET_DOWNLOAD_OPTIONS",
   CLICK_PDF_DOWNLOAD: "CNKI_CLICK_PDF_DOWNLOAD"
 };
@@ -497,6 +503,105 @@ async function getSearchResults(payload) {
   return readPage(tab, CNKI_MESSAGE.GET_SEARCH_RESULTS, { limit: payload?.limit });
 }
 
+async function setSearchField(payload) {
+  const field = typeof payload?.field === "string" ? payload.field.trim() : "";
+  if (!field) {
+    throw new Error("缺少检索字段 field。");
+  }
+  const tab = await getPreferredCnkiTab();
+  return readPage(tab, CNKI_MESSAGE.SET_SEARCH_FIELD, { field });
+}
+
+async function setLibrary(payload) {
+  const library = typeof payload?.library === "string" ? payload.library.trim() : "";
+  if (!library) {
+    throw new Error("缺少文献库 library。");
+  }
+  const tab = await getPreferredCnkiTab();
+  const navigation = waitForTabComplete(tab.id, 20_000).catch(() => null);
+  const applied = await readPage(tab, CNKI_MESSAGE.SET_LIBRARY, { library });
+  await navigation;
+  await sleep(900);
+  const refreshedTab = await getCnkiTab(tab.id);
+  const snapshot = await readPage(refreshedTab, CNKI_MESSAGE.GET_PAGE_SNAPSHOT);
+  return { ...applied, url: snapshot.url, title: snapshot.title };
+}
+
+// 翻页/筛选后结果表会异步刷新，用「结果签名 + 可见行数」变化判定刷新完成，
+// 与 sortCnkiSearchResults 同一套思路；这里额外允许结果变空也能正确返回。
+async function waitForResultChange(tab, before, limit = 20, timeoutMs = 15_000) {
+  const beforeSignature = resultSignature(before);
+  const beforeRows = before?.visibleRowCount ?? -1;
+  const deadline = Date.now() + timeoutMs;
+  let latest = before;
+  while (Date.now() < deadline) {
+    await sleep(600);
+    latest = await readPage(tab, CNKI_MESSAGE.GET_SEARCH_RESULTS, { limit });
+    if (resultSignature(latest) !== beforeSignature || latest.visibleRowCount !== beforeRows) {
+      return latest;
+    }
+  }
+  return latest;
+}
+
+async function turnPage(payload) {
+  const tab = await getPreferredCnkiTab();
+  const before = await readPage(tab, CNKI_MESSAGE.GET_SEARCH_RESULTS, { limit: 10 });
+  const applied = await readPage(tab, CNKI_MESSAGE.TURN_PAGE, payload);
+  const latest = await waitForResultChange(tab, before, payload?.limit || 20);
+  return { ...applied, results: latest };
+}
+
+async function getFilters(payload) {
+  const tab = await getPreferredCnkiTab();
+  return readPage(tab, CNKI_MESSAGE.GET_FILTERS, { groups: payload?.groups });
+}
+
+async function applyFilter(payload) {
+  const tab = await getPreferredCnkiTab();
+  const before = await readPage(tab, CNKI_MESSAGE.GET_SEARCH_RESULTS, { limit: 10 });
+  const applied = await readPage(tab, CNKI_MESSAGE.APPLY_FILTER, payload);
+  const latest = await waitForResultChange(tab, before, payload?.limit || 20);
+  return { ...applied, results: latest };
+}
+
+// 高级检索表单提交后页面会整页跳转到全新的结果页（AdvSearch -> defaultresult），
+// 不能像 applyFilter 那样用"结果签名变化"判定完成（提交前那页压根没有结果表可读）。
+// 也不能复用 waitForSearchResults 的 query 字符串比对（多字段组合检索没有单一
+// query 值对应一框式检索框）。这里只要求"能成功读到结果表"（哪怕 0 条也算数），
+// 与 setLibrary 的 waitForTabComplete + sleep 兜底思路一致。
+async function waitForAdvancedSearchResults(tab, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let latestError = null;
+  while (Date.now() < deadline) {
+    try {
+      return await readPage(tab, CNKI_MESSAGE.GET_SEARCH_RESULTS, { limit: 50 });
+    } catch (error) {
+      latestError = error;
+    }
+    await sleep(600);
+  }
+  throw new Error(`检索结果未在页面中就绪。${latestError ? `最后错误：${asErrorMessage(latestError)}` : ""}`);
+}
+
+async function submitAdvancedSearch(payload) {
+  const conditions = Array.isArray(payload?.conditions) ? payload.conditions : [];
+  if (conditions.length < 1) {
+    throw new Error("缺少检索条件 conditions。");
+  }
+  const tab = await getPreferredCnkiTab();
+  if (!new URL(tab.url).pathname.includes("/kns8s/AdvSearch")) {
+    throw new Error("当前标签不是 CNKI 高级检索页（AdvSearch），请先用 page.navigate 打开该页面。");
+  }
+  const navigation = waitForTabComplete(tab.id, 20_000).catch(() => null);
+  const submitted = await readPage(tab, CNKI_MESSAGE.SUBMIT_ADVANCED_SEARCH, { conditions });
+  await navigation;
+  await sleep(900);
+  const refreshedTab = await getCnkiTab(tab.id);
+  const results = await waitForAdvancedSearchResults(refreshedTab, 15_000);
+  return { ...submitted, tabId: refreshedTab.id, results };
+}
+
 // options.commandId 存在时表示这是单次 article.click_pdf_download Tool 调用
 // （source 固定为 "command"，结果要回传给对应的桥接 commandId）；
 // 批次流程调用时不传 commandId，source 为 "batch"。
@@ -729,6 +834,18 @@ async function executeBridgeCommand(command) {
       return sortCnkiSearchResults(command.payload);
     case "search.results":
       return getSearchResults(command.payload);
+    case "search.set_field":
+      return setSearchField(command.payload);
+    case "search.set_library":
+      return setLibrary(command.payload);
+    case "search.turn_page":
+      return turnPage(command.payload);
+    case "search.get_filters":
+      return getFilters(command.payload);
+    case "search.apply_filter":
+      return applyFilter(command.payload);
+    case "search.advanced_submit":
+      return submitAdvancedSearch(command.payload);
     case "article.download_options": {
       const tab = await getPreferredCnkiTab();
       return readPage(tab, CNKI_MESSAGE.GET_DOWNLOAD_OPTIONS);

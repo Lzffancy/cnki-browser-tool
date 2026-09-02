@@ -43,6 +43,12 @@ ALLOWED_ACTIONS = {
     "search.submit",
     "search.sort",
     "search.results",
+    "search.set_field",
+    "search.set_library",
+    "search.turn_page",
+    "search.get_filters",
+    "search.apply_filter",
+    "search.advanced_submit",
     "article.download_options",
     "article.click_pdf_download",
     "batch.start_pdf_download",
@@ -87,6 +93,40 @@ TOOL_DESCRIPTIONS: dict[str, dict[str, Any]] = {
     "search.results": {
         "description": "从当前活动 CNKI 检索页读取已渲染的论文列表及页面信息。",
         "payload": {"limit": "可选，1-50，默认 20"},
+    },
+    "search.set_field": {
+        "description": "切换一框式检索框的检索字段（主题/作者/篇名/全文等 16 项），切换后配合 search.submit 在该字段下检索。",
+        "payload": {"field": "必填：SU/TKA/KY/TI/FT/AU/FI/RP/AF/FU/AB/CO/RF/CLC/LY/DOI"},
+    },
+    "search.set_library": {
+        "description": "切换文献库（学术期刊/学位论文/博士/硕士/图书/会议等），用于把检索范围限定到学位论文等特定库。",
+        "payload": {"library": "必填：journal/dissertation/doctor/master/book/conference/newspaper/almanac/patent/standard/achievement"},
+    },
+    "search.turn_page": {
+        "description": "翻页到指定页码或上一页/下一页，并等待结果表刷新后读取。",
+        "payload": {"page": "可选，>=1 的目标页码（仅在当前可见页码内）；与 direction 二选一", "direction": "可选：next/prev，与 page 二选一"},
+    },
+    "search.get_filters": {
+        "description": "读取左侧筛选面板（来源类别/学科/研究层次/年度/文献类型/机构/基金等）的维度和可选值；可先展开指定折叠维度再读取。",
+        "payload": {"groups": "可选，字符串或字符串数组：要展开后读取的维度 groupid，如 YE(年度)/WXLX(文献类型)/YJCC(研究层次)"},
+    },
+    "search.apply_filter": {
+        "description": "勾选左侧筛选面板某维度的若干值并提交（例如年度=2023,2024），提交后等待结果表刷新。",
+        "payload": {"group": "必填，筛选维度 groupid，如 YE(年度)/WXLX(文献类型)", "values": "必填，字符串或字符串数组：要勾选的筛选值"},
+    },
+    "search.advanced_submit": {
+        "description": (
+            "在 CNKI 高级检索页（/kns8s/AdvSearch）填写 1-3 行字段+检索词并提交，支持 AND/OR/NOT 组合多条件精确检索。"
+            "字段集比一框式检索多了 TU(导师)/FTU(第一导师)/LY(学位授予单位)/XF(学科专业名称)，"
+            "是定位“某导师指导的论文”等一框式检索做不到的多条件场景的关键能力。"
+            "使用前须先用 page.navigate 打开形如 https://kns.cnki.net/kns8s/AdvSearch?type=expert&classid=<库代码>&language=CHS 的页面。"
+        ),
+        "payload": {
+            "conditions": (
+                "必填，1-3 个条件对象数组，每个对象含 field（SU/TKA/KY/TI/FT/AU/AF/TU/FTU/LY/FU/AB/CO/RF/CLC/XF/DOI）、"
+                "value（检索词）；第 2、3 个条件可选 logic（AND/OR/NOT，默认 AND）"
+            )
+        },
     },
     "article.download_options": {
         "description": "读取当前论文详情页已显示的下载入口，不触发下载。",
@@ -183,6 +223,29 @@ class CommandBroker:
 
 
 BROKER = CommandBroker()
+
+
+class SingleInstanceHTTPServer(ThreadingHTTPServer):
+    """继承 ThreadingHTTPServer，但关闭地址复用，确保单机只能有一个实例。
+
+    stdlib 的 http.server.HTTPServer 把类属性 allow_reuse_address 默认设为 1，
+    ThreadingHTTPServer 未覆盖该属性，因此原样继承。这个设置在 POSIX 下主要是
+    放宽 TIME_WAIT 状态下的重新绑定限制，但在 Windows 上语义完全不同：
+    SO_REUSEADDR 会允许多个进程同时 bind() 到同一个 127.0.0.1:<port> 而不报错，
+    谁都不知道对方存在。
+
+    本项目正是因此翻过车：一次遗留了 3-4 个 `bridge_server.py --mode mcp`
+    进程，netstat 里全部显示 LISTENING 在 8765，但每个进程持有自己独立的
+    CommandBroker 内存队列——Chrome 扩展的长轮询和 Agent 的调用命令可能落在
+    不同进程上，造成「等待插件响应超时」这类偶发甚至持续性故障，且没有任何
+    报错提示，非常隐蔽。
+
+    关掉 allow_reuse_address 后，第二个进程尝试 bind 同一端口会立刻收到
+    OSError（Windows 上是 WinError 10048 "通常每个套接字地址只允许使用一次"），
+    在 main() 里被捕获并打印清晰提示后退出，而不是静默地成为第二个幽灵监听者。
+    """
+
+    allow_reuse_address = False
 
 
 class BridgeRequestHandler(BaseHTTPRequestHandler):
@@ -343,10 +406,18 @@ def build_mcp_server() -> Any:
     lazy import：只有 --mode mcp 时才需要 mcp 依赖，--mode http 调试时
     仍可用系统自带 Python 直接跑，不强制安装额外依赖。
     """
-    from typing import Annotated, Literal
+    from typing import Annotated, Literal, Optional
 
     from mcp.server.fastmcp import FastMCP
-    from pydantic import Field
+    from pydantic import BaseModel, Field
+
+    class AdvancedSearchCondition(BaseModel):
+        field: Literal[
+            "SU", "TKA", "KY", "TI", "FT", "AU", "AF", "TU", "FTU",
+            "LY", "FU", "AB", "CO", "RF", "CLC", "XF", "DOI",
+        ] = Field(description="检索字段代码：SU=主题 TKA=篇关摘 KY=关键词 TI=题名 FT=全文 AU=作者 AF=作者单位 TU=导师 FTU=第一导师 LY=学位授予单位 FU=基金 AB=摘要 CO=目录 RF=参考文献 CLC=中图分类号 XF=学科专业名称 DOI=DOI。")
+        value: str = Field(min_length=1, max_length=120, description="检索词，1-120 字符。")
+        logic: Optional[Literal["AND", "OR", "NOT"]] = Field(default="AND", description="与上一行的连接符，仅第 2、3 个条件生效，默认 AND。")
 
     mcp = FastMCP(
         name="cnki-local-bridge",
@@ -430,6 +501,73 @@ def build_mcp_server() -> Any:
     ) -> Any:
         return run_bridge_action("search.results", {"limit": limit})
 
+    @mcp.tool(name="search.set_field", description=TOOL_DESCRIPTIONS["search.set_field"]["description"])
+    def search_set_field(
+        field: Annotated[
+            Literal["SU", "TKA", "KY", "TI", "FT", "AU", "FI", "RP", "AF", "FU", "AB", "CO", "RF", "CLC", "LY", "DOI"],
+            Field(description="检索字段代码：SU=主题 TKA=篇关摘 KY=关键词 TI=篇名 FT=全文 AU=作者 FI=第一作者 RP=通讯作者 AF=作者单位 FU=基金 AB=摘要 CO=小标题 RF=参考文献 CLC=分类号 LY=文献来源 DOI=DOI。"),
+        ],
+    ) -> Any:
+        return run_bridge_action("search.set_field", {"field": field})
+
+    @mcp.tool(name="search.set_library", description=TOOL_DESCRIPTIONS["search.set_library"]["description"])
+    def search_set_library(
+        library: Annotated[
+            Literal["journal", "dissertation", "doctor", "master", "book", "conference", "newspaper", "almanac", "patent", "standard", "achievement"],
+            Field(description="文献库：journal=学术期刊 dissertation=学位论文 doctor=博士 master=硕士 book=图书 conference=会议 newspaper=报纸 almanac=年鉴 patent=专利 standard=标准 achievement=成果。"),
+        ],
+    ) -> Any:
+        return run_bridge_action("search.set_library", {"library": library})
+
+    @mcp.tool(name="search.turn_page", description=TOOL_DESCRIPTIONS["search.turn_page"]["description"])
+    def search_turn_page(
+        page: Annotated[
+            Optional[int],
+            Field(default=None, ge=1, le=9999, description="目标页码（>=1），仅在当前可见页码内可用；与 direction 二选一。"),
+        ] = None,
+        direction: Annotated[
+            Optional[Literal["next", "prev"]],
+            Field(default=None, description="next=下一页，prev=上一页；与 page 二选一。"),
+        ] = None,
+    ) -> Any:
+        if page is None and direction is None:
+            raise RuntimeError("翻页需要 page 或 direction 之一。")
+        return run_bridge_action("search.turn_page", {"page": page, "direction": direction})
+
+    @mcp.tool(name="search.get_filters", description=TOOL_DESCRIPTIONS["search.get_filters"]["description"])
+    def search_get_filters(
+        groups: Annotated[
+            Optional[list[str]],
+            Field(default=None, description="要展开后读取的维度 groupid 数组，如 ['YE','WXLX','YJCC']；不传则只读已展开的维度。"),
+        ] = None,
+    ) -> Any:
+        return run_bridge_action("search.get_filters", {"groups": groups})
+
+    @mcp.tool(name="search.apply_filter", description=TOOL_DESCRIPTIONS["search.apply_filter"]["description"])
+    def search_apply_filter(
+        group: Annotated[
+            str,
+            Field(min_length=1, max_length=20, description="筛选维度 groupid，如 YE(年度)/WXLX(文献类型)/YJCC(研究层次)/LYBSM(来源类别)/CCL(学科)。"),
+        ],
+        values: Annotated[
+            list[str],
+            Field(min_length=1, max_length=20, description="要勾选的筛选值数组，如 ['2023','2024']。"),
+        ],
+    ) -> Any:
+        return run_bridge_action("search.apply_filter", {"group": group, "values": values})
+
+    @mcp.tool(name="search.advanced_submit", description=TOOL_DESCRIPTIONS["search.advanced_submit"]["description"])
+    def search_advanced_submit(
+        conditions: Annotated[
+            list[AdvancedSearchCondition],
+            Field(min_length=1, max_length=3, description="1-3 个检索条件，对应高级检索表单默认渲染的 3 行；使用前须先用 page.navigate 打开 /kns8s/AdvSearch 页面。"),
+        ],
+    ) -> Any:
+        return run_bridge_action(
+            "search.advanced_submit",
+            {"conditions": [condition.model_dump() for condition in conditions]},
+        )
+
     @mcp.tool(name="article.download_options", description=TOOL_DESCRIPTIONS["article.download_options"]["description"])
     def article_download_options() -> Any:
         return run_bridge_action("article.download_options", {})
@@ -485,7 +623,20 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), BridgeRequestHandler)
+    try:
+        server = SingleInstanceHTTPServer(("127.0.0.1", args.port), BridgeRequestHandler)
+    except OSError as error:
+        print(
+            f"[cnki-local-bridge] 无法监听 127.0.0.1:{args.port}：{error}",
+            file=sys.stderr,
+        )
+        print(
+            "[cnki-local-bridge] 这通常意味着已有另一个 bridge_server.py 实例正在运行"
+            "（很可能是上一个会话遗留的旧进程）。请先结束命令行中包含"
+            " bridge_server.py 的旧 python.exe 进程，再重新启动本进程。",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     if args.mode == "mcp":
         # stdio 模式下 stdout 是 MCP JSON-RPC 帧的专用通道，任何多余的 print

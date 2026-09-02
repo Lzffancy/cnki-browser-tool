@@ -8,7 +8,7 @@
 backend/.venv/Scripts/python.exe backend/bridge_server.py --mode mcp
 ```
 
-以标准 MCP stdio server 运行，14 个动作逐一注册为具名 Tool（名字与下文一致，如 `search.sort`、`batch.start_pdf_download`），参数用 JSON Schema（枚举、长度、范围）在协议层校验，支持 Tool 发现（`list_tools`），不用再手搓 curl 拼 JSON。同一进程会在后台线程原样启一份 HTTP 服务专门伺候 Chrome 扩展的长轮询（见方式二），因为 MV3 Service Worker 没有 `listen()` 能力，这段传输方式不受协议选型影响。
+以标准 MCP stdio server 运行，19 个动作逐一注册为具名 Tool（名字与下文一致，如 `search.sort`、`batch.start_pdf_download`），参数用 JSON Schema（枚举、长度、范围）在协议层校验，支持 Tool 发现（`list_tools`），不用再手搓 curl 拼 JSON。同一进程会在后台线程原样启一份 HTTP 服务专门伺候 Chrome 扩展的长轮询（见方式二），因为 MV3 Service Worker 没有 `listen()` 能力，这段传输方式不受协议选型影响。
 
 **方式二：裸 HTTP（`--mode http`，默认，向后兼容 / 手工调试）**
 
@@ -43,8 +43,12 @@ Content-Type: application/json
 
 ```text
 session.status
-  → session.open_search / search.submit
-  → search.results
+  → session.open_search / search.submit          （打开检索页 / 提交关键词）
+  → search.set_field                            （可选：切检索字段，如作者 AU）
+  → search.set_library                          （可选：切文献库，如学位论文 dissertation）
+  → search.get_filters                          （可选：发现年度/文献类型等筛选项）
+  → search.apply_filter                         （可选：应用筛选，如年度 2023-2025）
+  → search.results / search.sort / search.turn_page
   → 按业务规则筛选 articleUrl
   → batch.start_pdf_download
   → batch.get_status
@@ -244,6 +248,167 @@ search.submit("人工智能")
 
 ---
 
+### `search.set_field`
+
+**用途**：切换一框式检索框的检索字段（默认是「主题」）。切换后，再调用 `search.submit` 就会在所选字段下检索。
+
+**参数**：
+
+```json
+{
+  "field": "AU"
+}
+```
+
+| 字段 | 必填 | 约束 |
+|---|---:|---|
+| `field` | 是 | 16 个字段代码之一，见下表。 |
+
+**字段代码对照表**（取自页面下拉 `li[data-val]` 与隐藏域 `#selectfield`）：
+
+| 代码 | 中文 | 代码 | 中文 |
+|---|---|---|---|
+| `SU` | 主题 | `FU` | 基金 |
+| `TKA` | 篇关摘 | `AB` | 摘要 |
+| `KY` | 关键词 | `CO` | 小标题 |
+| `TI` | 篇名 | `RF` | 参考文献 |
+| `FT` | 全文 | `CLC` | 分类号 |
+| `AU` | 作者 | `LY` | 文献来源 |
+| `FI` | 第一作者 | `DOI` | DOI |
+| `RP` | 通讯作者 | | |
+| `AF` | 作者单位 | | |
+
+**典型用法**：`search.set_field({"field":"AU"})` 后 `search.submit({"query":"李牧南"})` 即在「作者」字段检索李牧南。
+
+**注意**：这是**单字段**检索。要「作者 AND 主题」这种多条件复合，单字段框放不下，需用知网专业检索（`AdvSearch?type=expert`，见本文末「待办」），当前版本暂未封装。
+
+---
+
+### `search.set_library`
+
+**用途**：切换文献库（顶部「文献类型」切换），把检索范围限定到学术期刊、学位论文、博士、硕士等特定库。这是「只看学位论文」最直接的入口。
+
+**参数**：
+
+```json
+{
+  "library": "master"
+}
+```
+
+| 字段 | 必填 | 约束 |
+|---|---:|---|
+| `library` | 是 | 11 个库代码之一，见下表。 |
+
+**库代码对照表**（取自页面 `a[name=classify][classid]`）：
+
+| 代码 | 中文 | classid |
+|---|---|---|
+| `journal` | 学术期刊 | `YSTT4HG0` |
+| `dissertation` | 学位论文（博士+硕士合计） | `LSTPFY1C` |
+| `doctor` | 博士 | `RMJLXHZ3` |
+| `master` | 硕士 | `JQIRZIYA` |
+| `book` | 图书 | `EMRPGLPA` |
+| `conference` | 会议 | `JUP3MUPD` |
+| `newspaper` | 报纸 | `MPMFIG1A` |
+| `almanac` | 年鉴 | `HHCPM1F8` |
+| `patent` | 专利 | `VUDIXAIY` |
+| `standard` | 标准 | `WQ0UVIAA` |
+| `achievement` | 成果 | `BLZOG7CK` |
+
+**典型用法**：先 `search.submit({"query":"人工智能"})` 得到结果，再 `search.set_library({"library":"dissertation"})` 把范围收敛到学位论文；或先切库再检索。页面会按所选库重新加载结果。
+
+**关键提示**：知网的「导师/指导教师」字段**只存在于学位论文库**（博士 CDFD、硕士 CMFD）。所以「某人作为指导老师的论文」必须先限定 `dissertation`/`doctor`/`master`，再去详情页核对导师字段。
+
+---
+
+### `search.turn_page`
+
+**用途**：翻页到指定页码，或上一页/下一页，并等待结果表刷新后返回新一页结果。
+
+**参数**（`page` 与 `direction` 二选一）：
+
+```json
+{ "page": 2 }
+```
+
+或
+
+```json
+{ "direction": "next" }
+```
+
+| 字段 | 必填 | 约束 |
+|---|---:|---|
+| `page` | 否 | >=1 的目标页码；仅当该页码在当前可见页码范围内（底部翻页条）时可点。 |
+| `direction` | 否 | `next`（下一页）/ `prev`（上一页）。 |
+
+**返回重点**：翻页方式、目标页码、当前页码、总页数，以及刷新后的 `results`。
+
+**注意**：底部翻页条只渲染当前页附近的页码（如 1-8、9-16…），不在可见范围内的页码无法直接跳转，需用 `direction=next` 逐步翻。总页数从 `.countPageMark[data-pagenum]` 读取（如 300 页），总数从 `.pagerTitleCell em` 读取。
+
+---
+
+### `search.get_filters`
+
+**用途**：读取左侧筛选面板的维度和可选值，用于 Agent 动态发现「年度」「文献类型」「研究层次」「来源类别」「学科」等维度的具体筛选项，再据此调用 `search.apply_filter`。
+
+**参数**：
+
+```json
+{
+  "groups": ["YE", "WXLX"]
+}
+```
+
+| 字段 | 必填 | 约束 |
+|---|---:|---|
+| `groups` | 否 | 字符串或字符串数组，指定要**先展开再读取**的维度 groupid。不传则只读当前已展开的维度。 |
+
+**返回重点**：每个维度的 `groupid`、`title`（中文名）、`folded`（是否折叠）、`items`（`value` + `text` + 计数）。
+
+**维度 groupid 对照**（取自页面 `dl[groupid]`）：
+
+| groupid | 中文 | 说明 |
+|---|---|---|
+| `YE` | 年度 | 默认折叠，需 `groups:["YE"]` 展开 |
+| `WXLX` | 文献类型 | 默认折叠，需展开 |
+| `YJCC` | 研究层次 | 默认折叠，需展开 |
+| `LYBSM` | 来源类别 | 北大核心/CSSCI/AMI/CSCD… 通常已展开 |
+| `CCL` | 学科 | 通常已展开 |
+| `WXLY` | 文献来源 | 默认折叠 |
+| `AFC` | 机构 | 默认折叠 |
+| `FUC` | 基金 | 默认折叠 |
+| `OA` | OA出版 | 默认折叠 |
+
+**典型用法**：`search.get_filters({"groups":["YE"]})` 先拿到年度可选值（2024、2023…），再 `search.apply_filter({"group":"YE","values":["2023","2024","2025"]})` 限定年份。
+
+---
+
+### `search.apply_filter`
+
+**用途**：勾选左侧筛选面板某维度的若干值并提交（相当于人工点 checkbox 再点「确定」），提交后等待结果表刷新。
+
+**参数**：
+
+```json
+{
+  "group": "YE",
+  "values": ["2023", "2024", "2025"]
+}
+```
+
+| 字段 | 必填 | 约束 |
+|---|---:|---|
+| `group` | 是 | 筛选维度 groupid（如 `YE`/`WXLX`/`YJCC`/`LYBSM`/`CCL`）。 |
+| `values` | 是 | 字符串数组，要勾选的筛选值（需先通过 `search.get_filters` 确认真实 value）。 |
+
+**页面行为**：展开目标维度 → 逐个勾选对应 checkbox → 点击「确定」（`a.btn-submit`，内部调用 `mutiSelectedGroup()`）→ 页面按筛选条件刷新结果。
+
+**注意**：筛选值必须与 `search.get_filters` 返回的 `value` 完全一致（如年度是 `"2023"` 而非 `"2023年"`）。若某值不存在，会返回未找到该值的错误。
+
+---
+
 ## 3. 单篇下载 Tool
 
 ### `article.download_options`
@@ -402,4 +567,15 @@ backend/.venv/Scripts/python.exe backend/bridge_server.py --mode mcp
 - **0.7.3**：修复 `article.click_pdf_download`（及批次下载内“点击后等待下载开始”这一步）里长达 30 秒的裸 `while + setTimeout` 轮询：改为点击后先做一次即时核实，未命中则把等待状态持久化到 `chrome.storage.local`，由 `chrome.downloads.onCreated` 真实事件和 `chrome.alarms` 兜底超时异步推进结果，避免 MV3 Service Worker 在裸计时器等待期间被系统终止导致"下载其实成功了，但桥接服务只等到超时"。
 - **0.7.4**：把 CNKI 标签定位从「必须是当前活动标签」放宽为「存在任意可用 CNKI 标签即可」。`service-worker.js` 新增 `getPreferredCnkiTab(preferredTabId)`，按「指定 tabId > 当前活动标签（若是 CNKI）> 任意已打开的 CNKI 标签」三级回退，替换原 `getActiveCnkiTab` 的全部调用；批次运行本就复用固定 `tabId`，这里顺带为批次增加该 tab 被关闭后的自动重定位兜底。效果：下载/检索期间切到别的标签或窗口不再中断，只有电脑睡眠/锁屏、或所有 CNKI 标签被关闭时才会暂停。
 - **0.2（backend）**：`bridge_server.py` 新增 `--mode mcp`，把 14 个动作注册为标准 MCP Tool（JSON Schema 校验 + Tool 发现），`--mode http` 保持原有行为不变；扩展侧协议与端点均未改动。
+- **0.7.5**：新增 5 个检索条件控制 Tool——`search.set_field`（切换检索字段，16 项）、`search.set_library`（切换文献库，11 项，含博士/硕士）、`search.turn_page`（翻页）、`search.get_filters`（读左侧筛选面板）、`search.apply_filter`（应用筛选，如年度区间）。`content/cnki-page.js` 的消息处理改为异步统一分发，以支持 facet 展开后的 AJAX 内容等待。动作总数由 14 增至 19。
+- **0.2.1（backend）**：修复 Windows 下的"多实例幽灵监听"问题——`bridge_server.py` 用的 `ThreadingHTTPServer` 默认 `allow_reuse_address = 1`，这个设置在 POSIX 下只放宽 TIME_WAIT 状态复用，但在 Windows 上会让多个进程同时 bind 到同一个 `127.0.0.1:<port>` 而互不报错、互不知情，导致偶发/持续性的"等待插件响应超时"（每个进程有自己独立的内存 `CommandBroker`，扩展轮询和 Agent 调用可能落在不同进程上）。新增 `SingleInstanceHTTPServer` 子类显式关闭 `allow_reuse_address`，`main()` 里捕获 bind 时的 `OSError` 并给出清晰提示后退出，避免静默产生第二个幽灵监听者。
+- **0.7.6**：新增 `search.advanced_submit`（AdvSearch 高级检索页，1-3 条件 AND/OR/NOT，字段含 TU导师/FTU第一导师/LY学位授予单位/XF学科专业名称，一框式检索没有这几个字段），动作总数 19→20。顺手修复检索框兼容性 bug：知网学位论文库翻页/切库后 `<input class="search-input">` 会丢失 `id="txt_search"`，`getSearchInput()` 原来要求 `#txt_search.search-input` 同时匹配 id+class 导致识别失败，改成只认 class。
+- **0.7.7**：修复 `search.advanced_submit` 切库后可能落在错误 tab 的问题——AdvSearch 同一个 URL 下「高级检索/专业检索/作者发文检索/句子检索」共享 DOM，切换文献库后默认激活的 tab 不一定是"高级检索"（如学术期刊库 classid=YSTT4HG0 默认落在"专业检索"），此时字段下拉尚未按当前库初始化。调用前先探测 `li[name="gradeSearch"]` 是否 active，不是则先 click 切过去。
+- **0.7.8**：修复 `search.advanced_submit` 的表单残留 bug——原实现只填 `conditions.length` 行，从不清空多出来的行；同一个标签页连续调用、且这次条件数比上次少时，上次残留的检索词会静默叠加生效（例如先提交 2 条件拿到结果，再在同一 tab 只传 1 条件想验证"去掉某限制后有多少条"，实际上第 2 行的旧值根本没清，结果会一样）。修复：调用时先清空 `rows.slice(conditions.length)` 里残留的输入框。**教训**：验证"改变条件后结果是否变化"这类假设时必须先 `page.navigate` 刷新到干净页面再提交，不要在已提交过的 tab 上连续调用对比，否则可能得出错误结论。
+
+## 8. 已知限制与待办
+
+- ~~多条件 AND/OR 复合检索~~：已在 0.7.6 通过 `search.advanced_submit` 实现（AdvSearch 高级检索表单，1-3 条件 AND/OR/NOT）。
+- ~~导师字段归因~~：已确认「导师」是高级检索表单本身支持的字段（`TU`），学位论文库直接可用 `TU='某人'` 精确检索，不需要逐篇进详情页抓取。
+- **跨页聚合**：`search.turn_page` 只能翻到可见页码，大批量场景需要「逐页读取并聚合」，尚未封装。
 

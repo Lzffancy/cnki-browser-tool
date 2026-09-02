@@ -9,6 +9,9 @@ venv/
 current-search-dom.json
 search-page-dom.json
 
+# Debug logs
+*.log
+
 # OS
 .DS_Store
 Thumbs.db
