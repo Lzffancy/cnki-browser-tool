@@ -2,25 +2,14 @@
 
 本文件定义本机 Agent 可调用的受限 Tool。`backend/bridge_server.py` 支持两种调用方式，底层是同一个 `CommandBroker` 队列，只是 Agent 侧的协议不同：
 
-**方式一：MCP（推荐，`--mode mcp`）**
+**方式一：裸 HTTP / curl（推荐，`--mode http`，默认）**
+
+一条 curl 就能调任意 Tool，只占用一个通用入口（`action` + `payload`），不需要把 20 个 Tool 的 JSON Schema 全部加载进 Agent 上下文，token 与往返开销最低，也最适合手工排障：
 
 ```bash
-backend/.venv/Scripts/python.exe backend/bridge_server.py --mode mcp
-```
-
-以标准 MCP stdio server 运行，19 个动作逐一注册为具名 Tool（名字与下文一致，如 `search.sort`、`batch.start_pdf_download`），参数用 JSON Schema（枚举、长度、范围）在协议层校验，支持 Tool 发现（`list_tools`），不用再手搓 curl 拼 JSON。同一进程会在后台线程原样启一份 HTTP 服务专门伺候 Chrome 扩展的长轮询（见方式二），因为 MV3 Service Worker 没有 `listen()` 能力，这段传输方式不受协议选型影响。
-
-**方式二：裸 HTTP（`--mode http`，默认，向后兼容 / 手工调试）**
-
-```text
-POST http://127.0.0.1:8765/v1/call
-Content-Type: application/json
-
-{
-  "action": "Tool 名称",
-  "payload": { },
-  "timeoutSeconds": 45
-}
+curl -s -X POST http://127.0.0.1:8765/v1/call \
+  -H "Content-Type: application/json" \
+  -d '{"action":"search.results","payload":{"limit":20},"timeoutSeconds":45}'
 ```
 
 响应格式：
@@ -33,9 +22,46 @@ Content-Type: application/json
 }
 ```
 
-不依赖 `mcp` 包，可用系统自带 Python 直接跑，适合 curl 手工调试；扩展侧的轮询端点（`/v1/extension/next-command`、`/v1/extension/command-result`）在两种模式下行为完全一致。
+不依赖 `mcp` 包，可用系统自带 Python 直接跑。
+
+**方式二：MCP（可选，`--mode mcp`）**
+
+```bash
+backend/.venv/Scripts/python.exe backend/bridge_server.py --mode mcp
+```
+
+以标准 MCP stdio server 运行，20 个动作逐一注册为具名 Tool（名字与下文一致，如 `search.sort`、`batch.start_pdf_download`），参数用 JSON Schema（枚举、长度、范围）在协议层校验，支持 Tool 发现（`list_tools`）。适合希望 host 原生发现工具、带权限与 UI 的场景（如把 server 注册进 WorkBuddy 的 MCP 配置，由 host 拉起进程）。代价是 20 个 Tool 的 schema 会进入上下文。同一进程会在后台线程原样启一份 HTTP 服务专门伺候 Chrome 扩展的长轮询（见方式一），因为 MV3 Service Worker 没有 `listen()` 能力，这段传输方式不受协议选型影响。
+
+**快速自检（两种模式通用）**：
+
+```bash
+curl -s http://127.0.0.1:8765/health
+```
+
+返回 `service`、`extension.connected`（扩展是否已连上本服务）、`extension.lastSeenSecondsAgo`、以及全部 `allowedActions` / `tools`。这是判断「服务起来没、扩展连上没」最直接的一条命令，不依赖扩展本身——扩展最长约 30 秒轮询一次，加载扩展后 `extension.connected` 会在该窗口内变成 `true`。
 
 所有 Tool 均只会通过已登录 Chrome 内的 CNKI 页面执行。它们不会导出 Cookie、调用 CNKI 下载接口、启动无头浏览器、绕过验证码或权限控制。
+
+**内置客户端库（Agent 复用，可选）**：仓库根目录的 `cnki_client.py` 把「调用 + 解析 + 批量下载 + PDF 提取」封装成纯标准库函数，供 Agent 复用，避免每次手搓 urllib 或另写 `_*.py` 临时脚本。核心函数：
+
+```python
+from cnki_client import (
+    call,                 # 调任意 action，永不抛异常，判断 resp.get("ok") 即可
+    health,               # GET /health 自检
+    run_flow,             # flow.run 一次串多步
+    extract_results,      # 从返回里抽出论文列表（兼容 data.results.results 嵌套）
+    extract_article_urls, # 抽详情页 URL，喂给批量下载
+    start_batch,          # batch.start_pdf_download
+    batch_status,         # batch.get_status
+    resume_batch,         # batch.resume_pdf_download
+    recent_downloads,     # download.recent
+    extract_pdf_text,     # 提取单个 PDF 全文（可选依赖 pdfplumber）
+)
+```
+
+也可当命令行用：`python cnki_client.py --health`、`--list <action> [payload] [n]`、`--url <action> [payload] [n]`、`--download '<urls 数组>'`、`--status`。
+
+注意：这是**便利层而非强制 API**。若某个任务它覆盖不了（新的动作组合、特殊解析逻辑），Agent 仍可现场写一次性脚本——只是别重复发明已经封装的通用逻辑。
 
 **参数命名对照**：下文各 Tool 的参数名是 HTTP `payload` 里的字段名（驼峰式，如 `sortBy`、`articleUrls`、`intervalSeconds`、`maxChars`）；MCP 模式下同一参数按 Python 习惯改成蛇形命名（`sort_by`、`article_urls`、`interval_seconds`、`max_chars`），语义、默认值、取值范围完全一致，只是命名风格不同。
 
@@ -69,7 +95,8 @@ session.status
 
 - `activeTab`：当前标签 ID、标题、URL、是否为 CNKI；
 - `cnkiTabs`：已打开 CNKI 标签列表；
-- `canOpenSearch`：是否允许插件新建 CNKI 检索标签。
+- `canOpenSearch`：是否允许插件新建 CNKI 检索标签；
+- `login`：登录状态启发式检测结果，`state` 取值 `logged_in` / `logged_out` / `unknown` / `no_cnki_tab`，附 `evidence` 说明判断依据。该检测诚实标注不确定性——拿不准就返回 `unknown`，不猜测，下载前建议以它为准做一次兜底提示。
 
 **适用场景**：Agent 在调用页面读取或下载前，先判断浏览器是否已有可复用的 CNKI 页面。
 
@@ -534,7 +561,76 @@ search.submit("人工智能")
 
 ---
 
-## 5. 调用约束
+## 5. 组合流程 Tool（flow.run）
+
+### `flow.run`
+
+**用途**：用一次调用按顺序执行多个基础动作，把「开检索页 → 切文献库 → 检索 → 排序 → 读结果」这类整段流程压成一条 curl，减少 Agent 往返和 token 消耗。
+
+**参数**：
+
+```json
+{
+  "steps": [
+    { "action": "search.set_library", "payload": { "library": "master" } },
+    { "action": "search.submit", "payload": { "query": "大语言模型" } },
+    { "action": "search.sort", "payload": { "sortBy": "citations", "limit": 10 } },
+    { "action": "search.results", "payload": { "limit": 10 } }
+  ],
+  "timeoutSeconds": 45
+}
+```
+
+| 字段 | 必填 | 约束 |
+|---|---:|---|
+| `steps` | 是 | 1-20 个动作对象，每个含 `action`（已注册基础动作名，不可为 `flow.run`）和 `payload`（该动作的参数对象，缺省 `{}`）。 |
+| `timeoutSeconds` | 否 | 每一步的上限秒数（不是总时长），默认 40，最大 45。 |
+
+**执行语义（拟人、可中断、可观测）**：
+
+- `flow.run` 由桥接服务在**本机服务端拆解**，逐步放进同一个命令队列，扩展侧无感知；每一步与单独调用该 action **完全等价**——仍是真实的页面操作，不新增任何行为，也不会为了提速而跳过等待。
+- **某一步失败即停在该步**，返回已完成的逐步明细（`steps` 数组里每步带 `ok` / `data` 或 `error`），不会自动重试、不会绕过登录/验证码。失败原因会指明是第几步（`failedAt`）。
+- 不引入任何变量传递或条件分支——如果第 N 步的结果要被第 N+1 步使用（例如 `search.results` 拿到的 `articleUrl` 喂给 `batch.start_pdf_download`），请拆成两次调用：先跑检索 flow 拿到结果，再单独调 `batch.start_pdf_download`。保持 `flow.run` 只做「纯顺序编排」，语义一眼能看懂。
+
+**返回结构**：
+
+```json
+{
+  "ok": true,
+  "data": {
+    "completed": 3,
+    "total": 4,
+    "failedAt": 3,
+    "stopped": true,
+    "steps": [
+      { "index": 0, "action": "search.set_library", "ok": true, "data": { } },
+      { "index": 1, "action": "search.submit", "ok": true, "data": { } },
+      { "index": 2, "action": "search.sort", "ok": true, "data": { } },
+      { "index": 3, "action": "search.results", "ok": false, "error": "…" }
+    ]
+  }
+}
+```
+
+**典型模板**（硕士论文按被引排序）：
+
+```bash
+curl -s -X POST http://127.0.0.1:8765/v1/call \
+  -H "Content-Type: application/json" \
+  -d '{"action":"flow.run","payload":{"steps":[
+    {"action":"session.open_search","payload":{}},
+    {"action":"search.set_library","payload":{"library":"master"}},
+    {"action":"search.submit","payload":{"query":"大语言模型"}},
+    {"action":"search.sort","payload":{"sortBy":"citations","limit":10}},
+    {"action":"search.results","payload":{"limit":10}}
+  ]}}'
+```
+
+**安全边界**：`steps` 只允许引用 `allowedActions` 里除 `flow.run` 以外的动作；不接受任意 JavaScript、CSS Selector 或下载直链。这一步校验在服务端完成，不依赖扩展。
+
+---
+
+## 6. 调用约束
 
 1. 一期批量最多 10 篇，必须顺序下载；
 2. Agent 只能使用上述命名 Tool，不可调用任意 JavaScript、CSS Selector、下载 URL 或浏览器 Cookie；
@@ -543,7 +639,7 @@ search.submit("人工智能")
 
 ---
 
-## 6. MCP 模式环境准备
+## 7. MCP 模式环境准备
 
 `--mode mcp` 需要 `mcp` 包（本项目锁定 `mcp<2`，因为 2.x 把 `FastMCP` 改名成 `MCPServer` 且 API 结构变了，社区文档还没跟上）；`--mode http` 不需要任何第三方依赖，可直接用系统 Python 跑。
 
@@ -560,7 +656,9 @@ backend/.venv/Scripts/python.exe backend/bridge_server.py --mode mcp
 
 ---
 
-## 7. 版本变更记录
+## 8. 版本变更记录
+
+- **0.8.0**：新增 `flow.run` 组合流程 Tool（服务端拆解为逐步基础动作，失败即停返回逐步明细，纯顺序编排不引入变量传递）；`/health` 增加 `extension.connected` / `extension.lastSeenSecondsAgo` 自检字段（扩展每次长轮询刷新时间戳）；`session.status` 增加 `login` 登录状态启发式检测（`logged_in`/`logged_out`/`unknown`/`no_cnki_tab` + `evidence`，诚实标注不确定性）。动作总数 20→21。
 
 - **0.7.1**：`download.recent` 从读取会被 MV3 Worker 重启清空的内存缓存，改为直接查询 `chrome.downloads.search`（见上文 `download.recent` 小节）。
 - **0.7.2**：删除 `service-worker.js` 中未被调用的死代码 `waitForDownloadCompletion`（及配套常量 `MAX_DOWNLOAD_COMPLETE_WAIT_MS`），不影响任何已有行为。
@@ -573,7 +671,7 @@ backend/.venv/Scripts/python.exe backend/bridge_server.py --mode mcp
 - **0.7.7**：修复 `search.advanced_submit` 切库后可能落在错误 tab 的问题——AdvSearch 同一个 URL 下「高级检索/专业检索/作者发文检索/句子检索」共享 DOM，切换文献库后默认激活的 tab 不一定是"高级检索"（如学术期刊库 classid=YSTT4HG0 默认落在"专业检索"），此时字段下拉尚未按当前库初始化。调用前先探测 `li[name="gradeSearch"]` 是否 active，不是则先 click 切过去。
 - **0.7.8**：修复 `search.advanced_submit` 的表单残留 bug——原实现只填 `conditions.length` 行，从不清空多出来的行；同一个标签页连续调用、且这次条件数比上次少时，上次残留的检索词会静默叠加生效（例如先提交 2 条件拿到结果，再在同一 tab 只传 1 条件想验证"去掉某限制后有多少条"，实际上第 2 行的旧值根本没清，结果会一样）。修复：调用时先清空 `rows.slice(conditions.length)` 里残留的输入框。**教训**：验证"改变条件后结果是否变化"这类假设时必须先 `page.navigate` 刷新到干净页面再提交，不要在已提交过的 tab 上连续调用对比，否则可能得出错误结论。
 
-## 8. 已知限制与待办
+## 9. 已知限制与待办
 
 - ~~多条件 AND/OR 复合检索~~：已在 0.7.6 通过 `search.advanced_submit` 实现（AdvSearch 高级检索表单，1-3 条件 AND/OR/NOT）。
 - ~~导师字段归因~~：已确认「导师」是高级检索表单本身支持的字段（`TU`），学位论文库直接可用 `TU='某人'` 精确检索，不需要逐篇进详情页抓取。

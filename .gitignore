@@ -4,6 +4,10 @@ __pycache__/
 .venv/
 venv/
 
+# Agent 即兴生成的临时脚本 / 调试产物（正式复用入口见 cnki_client.py）
+_*.py
+_paper_txt/
+
 # Debug / captured page dumps (large, may contain scraped page content)
 *-dom.json
 current-search-dom.json
