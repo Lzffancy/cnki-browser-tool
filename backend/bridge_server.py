@@ -11,7 +11,7 @@
   不依赖 mcp 包，可用系统自带 Python 直接跑，适合 curl 手工调试。
 
 - mcp：作为标准 MCP stdio server 运行，供支持 MCP 协议的 Agent host（如
-  WorkBuddy）通过 stdin/stdout 发现和调用 14 个具名 Tool，参数用
+  WorkBuddy）通过 stdin/stdout 发现和调用 21 个具名 Tool，参数用
   JSON Schema（枚举、范围、长度）在协议层做校验，不用再手搓 curl。
   扩展侧仍然只认 HTTP 长轮询——Chrome MV3 Service Worker 没有 listen()
   能力，这一段传输方式不受协议选型影响，因此本模式会在后台线程里原样
@@ -529,6 +529,8 @@ def build_mcp_server() -> Any:
             "推荐调用顺序：session.status -> session.open_search/search.submit -> search.results "
             "-> (可选 search.sort) -> 按业务规则筛选 articleUrl -> batch.start_pdf_download "
             "-> batch.get_status -> 仅在用户处理了页面阻塞后才调用 batch.resume_pdf_download。"
+            "注意：本 MCP 只覆盖中文文献（CNKI）。国际文献（Crossref/DOI）检索另有仓库根目录的 "
+            "crossref_client.py 直连官方开放 API，不属于本 MCP 范围。"
         ),
     )
 

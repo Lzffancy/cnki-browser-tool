@@ -82,8 +82,10 @@ backend/.venv/Scripts/python.exe backend/bridge_server.py --mode mcp
 直接把下面这段贴给 WorkBuddy / dsh trace 等 Agent 客户端，它就能用本地工具了：
 
 ```text
-本机已运行一个「CNKI 本地研究助手」，通过 HTTP 服务暴露受限工具，用于在用户已登录的
-Chrome 里执行拟人化的知网检索与 PDF 下载（不导出 Cookie、不直连接口、不绕过验证码）。
+本机已运行一个论文研究工具集，包含两个平级的数据源，按需选择或都查。
+
+一、CNKI（中文文献）—— 走本机桥接服务，拟人化浏览器检索 + PDF 下载
+（不导出 Cookie、不直连接口、不绕过验证码）。
 
 - 服务地址：http://127.0.0.1:8765
 - 自检：curl -s http://127.0.0.1:8765/health  → 看 extension.connected 是否为 true
@@ -97,6 +99,19 @@ Chrome 里执行拟人化的知网检索与 PDF 下载（不导出 Cookie、不�
 - 约束：只驱动真实页面原生交互；遇登录/验证码/权限提示就停下让用户处理；下载 URL 只接受详情页地址
 - 复用：仓库根目录的 `cnki_client.py` 是现成的客户端库，`from cnki_client import call, extract_results, start_batch, batch_status` 即可用；
   优先复用它解析结果、批量下载，不要每次另写 `_*.py`。它覆盖不了的特殊需求，才允许你现场写一次性脚本
+
+二、Crossref/DOI（国际文献）—— 直连官方开放 API，零浏览器、零 VPN、零 Cookie，
+检索 + 元数据 + 全球被引 + OA 免费版定位。
+
+- 用途：英文关键词、国际期刊/会议论文；输入 DOI 拉元数据、查全球被引、找免费 PDF
+- 复用：仓库根目录的 `crossref_client.py` 是现成的客户端库，
+  `from crossref_client import search, resolve, check_oa, resolve_with_oa` 即可用
+- 说明：真正付费墙的论文，check_oa 能先判有没有免费合法版本（有则直接给 PDF 链接）；
+  没有免费版的，才需要用户回到学校 VPN 的浏览器贴 DOI 手动下全文
+
+判断规则：用户明确指定语言/来源 → 走对应源；没指定 → 两个源都查，结果按来源合并。
+英文/DOI 场景优先 Crossref，中文场景优先 CNKI。两个源的输出字段已基本对齐
+（title/authors/source/year/citations/doi），下游无需感知数据源差异。
 ```
 
 ## 安全边界
