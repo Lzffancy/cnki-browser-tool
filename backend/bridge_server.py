@@ -55,8 +55,13 @@ ALLOWED_ACTIONS = {
     "batch.get_status",
     "batch.resume_pdf_download",
     "download.recent",
+    "flow.run",
 }
 MAX_CALL_TIMEOUT_SECONDS = 45
+# flow.run 的每步上限与单动作一致，但总步数受限，避免一次调用失控。
+MAX_FLOW_STEPS = 20
+# 扩展每次长轮询都会刷新这个时间戳；/health 用它判断「扩展是否真的连上了本服务」。
+EXTENSION_ALIVE_WINDOW_SECONDS = 90
 DEFAULT_MCP_CALL_TIMEOUT_SECONDS = 40
 
 # Tool 元数据同时服务于 /health 自描述接口和 MCP Tool 注册。
@@ -155,6 +160,20 @@ TOOL_DESCRIPTIONS: dict[str, dict[str, Any]] = {
         "description": "查询 Chrome 下载历史中最近创建或更新的下载任务（实时查询，不依赖插件内存缓存）。",
         "payload": {"limit": "可选，1-50，默认 20"},
     },
+    "flow.run": {
+        "description": (
+            "按顺序执行一组基础动作（steps），用一次调用完成整段拟人化检索流程（例如开检索页->切文献库->"
+            "提交检索->按被引排序->读取结果）。每一步仍是与单独调用完全等价的真实页面操作，"
+            "不会新增任何页面行为、不会自动重试或绕过登录/验证码；某一步失败即在当前步停下，"
+            "返回已完成步骤的逐步明细，便于人工介入后继续。steps 只能引用已注册的基础动作，不接受脚本或选择器。"
+        ),
+        "payload": {
+            "steps": (
+                "必填，1-20 个动作对象数组，每个含 action（已注册基础动作名，不可为 flow.run）"
+                "和 payload（该动作的参数对象，缺省 {}）"
+            )
+        },
+    },
 }
 
 
@@ -175,6 +194,8 @@ class CommandBroker:
         self._commands: dict[str, Command] = {}
         self._queue: list[str] = []
         self._condition = threading.Condition()
+        # 扩展最近一次长轮询到达的时间戳（epoch 秒）。0 表示从未连接。
+        self.last_extension_seen: float = 0.0
 
     def enqueue(self, action: str, payload: dict[str, Any]) -> Command:
         command = Command(command_id=str(uuid.uuid4()), action=action, payload=payload)
@@ -282,15 +303,28 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/health":
+            now = time.time()
+            last_seen = BROKER.last_extension_seen
+            connected = last_seen > 0 and (now - last_seen) < EXTENSION_ALIVE_WINDOW_SECONDS
             self._send_json(HTTPStatus.OK, {
                 "ok": True,
                 "service": "cnki-local-bridge",
+                "extension": {
+                    "connected": connected,
+                    "lastSeenSecondsAgo": round(now - last_seen, 1) if last_seen > 0 else None,
+                    "hint": (
+                        None if connected else
+                        "未检测到 Chrome 扩展连接。请确认已在 chrome://extensions 加载 extension/ 目录，"
+                        "并保持 Chrome 运行；扩展最长约 30 秒轮询一次。"
+                    )
+                },
                 "allowedActions": sorted(ALLOWED_ACTIONS),
                 "tools": {action: TOOL_DESCRIPTIONS[action] for action in sorted(ALLOWED_ACTIONS)}
             })
             return
 
         if parsed.path == "/v1/extension/next-command":
+            BROKER.last_extension_seen = time.time()
             raw_wait = parse_qs(parsed.query).get("wait", ["20"])[0]
             try:
                 wait_seconds = min(max(int(raw_wait), 1), 25)
@@ -339,6 +373,16 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                 timeout = min(max(int(timeout), 1), MAX_CALL_TIMEOUT_SECONDS)
             except (TypeError, ValueError):
                 self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "timeoutSeconds 必须为整数。"})
+                return
+
+            # flow.run 由本服务拆解为逐步基础动作，在服务端串行执行；
+            # 扩展侧对此无感知，每一步仍是与单独调用等价的一次入队+等待。
+            if action == "flow.run":
+                result, flow_error = execute_flow(command_payload, timeout)
+                if flow_error:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": flow_error})
+                    return
+                self._send_json(HTTPStatus.OK, {"ok": True, "data": result})
                 return
 
             command = BROKER.enqueue(action, command_payload)
@@ -398,6 +442,57 @@ def run_bridge_action(action: str, payload: dict[str, Any], timeout_seconds: int
     return completed.result
 
 
+def execute_flow(payload: dict[str, Any], step_timeout_seconds: int) -> tuple[dict[str, Any] | None, str | None]:
+    """拆解并串行执行 flow.run 的 steps。
+
+    返回 (result, error)：成功时 result 为逐步明细 dict、error 为 None；参数非法时
+    result 为 None、error 为原因字符串。每一步失败都会停在该步，但整体仍视为「已执行到
+    N 步」，通过 result 里的 steps/stopped 表达，不抛异常——因为某一步失败是业务结果，
+    不是协议错误，调用方需要拿到逐步明细而不是一个笼统的失败。
+    """
+    steps = payload.get("steps")
+    if not isinstance(steps, list) or not steps:
+        return None, "flow.run 需要非空的 steps 数组。"
+    if len(steps) > MAX_FLOW_STEPS:
+        return None, f"flow.run 最多支持 {MAX_FLOW_STEPS} 步。"
+    for index, step in enumerate(steps):
+        if not isinstance(step, dict):
+            return None, f"第 {index + 1} 步必须是对象。"
+        step_action = step.get("action")
+        if step_action == "flow.run":
+            return None, "flow.run 不支持嵌套。"
+        if step_action not in ALLOWED_ACTIONS:
+            return None, f"第 {index + 1} 步的 action 不受支持：{step_action}。"
+        step_payload = step.get("payload", {})
+        if not isinstance(step_payload, dict):
+            return None, f"第 {index + 1} 步的 payload 必须是对象。"
+
+    results: list[dict[str, Any]] = []
+    for index, step in enumerate(steps):
+        step_action = step["action"]
+        step_payload = step.get("payload", {})
+        try:
+            data = run_bridge_action(step_action, step_payload, timeout_seconds=step_timeout_seconds)
+            results.append({"index": index, "action": step_action, "ok": True, "data": data})
+        except RuntimeError as error:
+            results.append({"index": index, "action": step_action, "ok": False, "error": str(error)})
+            return {
+                "completed": index,
+                "total": len(steps),
+                "failedAt": index,
+                "stopped": True,
+                "steps": results,
+            }, None
+
+    return {
+        "completed": len(steps),
+        "total": len(steps),
+        "failedAt": None,
+        "stopped": False,
+        "steps": results,
+    }, None
+
+
 def build_mcp_server() -> Any:
     """构建一个 MCP stdio server，把 14 个受限动作注册为具名 Tool。
 
@@ -418,6 +513,13 @@ def build_mcp_server() -> Any:
         ] = Field(description="检索字段代码：SU=主题 TKA=篇关摘 KY=关键词 TI=题名 FT=全文 AU=作者 AF=作者单位 TU=导师 FTU=第一导师 LY=学位授予单位 FU=基金 AB=摘要 CO=目录 RF=参考文献 CLC=中图分类号 XF=学科专业名称 DOI=DOI。")
         value: str = Field(min_length=1, max_length=120, description="检索词，1-120 字符。")
         logic: Optional[Literal["AND", "OR", "NOT"]] = Field(default="AND", description="与上一行的连接符，仅第 2、3 个条件生效，默认 AND。")
+
+    # flow.run 的 step 只允许引用已注册的基础动作（排除 flow.run 自身）。
+    FLOW_STEP_ACTIONS = tuple(sorted(action for action in ALLOWED_ACTIONS if action != "flow.run"))
+
+    class FlowStep(BaseModel):
+        action: Literal[FLOW_STEP_ACTIONS] = Field(description="基础动作名，如 search.submit / search.results / batch.start_pdf_download。")
+        payload: dict[str, Any] = Field(default_factory=dict, description="该动作的参数对象，缺省为空对象。")
 
     mcp = FastMCP(
         name="cnki-local-bridge",
@@ -608,6 +710,21 @@ def build_mcp_server() -> Any:
         ] = 20,
     ) -> Any:
         return run_bridge_action("download.recent", {"limit": limit})
+
+    @mcp.tool(name="flow.run", description=TOOL_DESCRIPTIONS["flow.run"]["description"])
+    def flow_run(
+        steps: Annotated[
+            list[FlowStep],
+            Field(min_length=1, max_length=MAX_FLOW_STEPS, description="按顺序执行的基础动作数组；每步失败即停，返回逐步明细。"),
+        ],
+    ) -> Any:
+        result, error = execute_flow(
+            {"steps": [step.model_dump() for step in steps]},
+            DEFAULT_MCP_CALL_TIMEOUT_SECONDS,
+        )
+        if error:
+            raise RuntimeError(error)
+        return result
 
     return mcp
 

@@ -1,5 +1,5 @@
 (() => {
-  const SCRIPT_VERSION = "0.7.8";
+  const SCRIPT_VERSION = "0.8.0";
   if (globalThis.__cnkiResearchAssistantVersion === SCRIPT_VERSION) {
     return;
   }
@@ -61,6 +61,42 @@
       htmlLength: html.length,
       returnedLength: Math.min(html.length, maxChars),
       truncated: html.length > maxChars
+    };
+  }
+
+  function getLoginState() {
+    // 启发式判断，诚实标注不确定性。知网登录态没有稳定公开的 DOM 契约，
+    // 这里只报告明确信号，拿不准就返回 unknown，绝不猜测，供用户人工复核。
+    const bodyText = normalizeText(document.body?.innerText ?? "");
+    const hasLogout = /(退出登录|退出|注销)/.test(bodyText);
+    const hasWelcome = /(欢迎|您好)\s*[,，]/.test(bodyText);
+
+    if (hasLogout || hasWelcome) {
+      return {
+        state: "logged_in",
+        evidence: hasLogout ? "页面含退出/注销入口" : "页面含欢迎语（用户名/机构名）",
+        checkedAt: new Date().toISOString()
+      };
+    }
+
+    // 未登录：只在顶部导航区域找「登录」入口，避免正文里的"登录"字样误判。
+    const headerText = normalizeText(
+      [...document.querySelectorAll("header, .header, .top, #top, .nav, .navbar, [class*=login], [class*=Login], [id*=login], [id*=Login]")]
+        .map((element) => element.textContent || "")
+        .join(" ")
+    );
+    if (/登录/.test(headerText) && !/(退出|注销)/.test(headerText)) {
+      return {
+        state: "logged_out",
+        evidence: "顶部导航区含登录入口且无退出/注销",
+        checkedAt: new Date().toISOString()
+      };
+    }
+
+    return {
+      state: "unknown",
+      evidence: "无法从页面文本可靠判断登录状态，请人工确认是否已登录知网",
+      checkedAt: new Date().toISOString()
     };
   }
 
@@ -605,7 +641,8 @@
     "CNKI_APPLY_FILTER",
     "CNKI_SUBMIT_ADVANCED_SEARCH",
     "CNKI_GET_DOWNLOAD_OPTIONS",
-    "CNKI_CLICK_PDF_DOWNLOAD"
+    "CNKI_CLICK_PDF_DOWNLOAD",
+    "CNKI_GET_LOGIN_STATE"
   ];
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -641,6 +678,8 @@
           return getDownloadOptions();
         case "CNKI_CLICK_PDF_DOWNLOAD":
           return clickPdfDownload();
+        case "CNKI_GET_LOGIN_STATE":
+          return getLoginState();
         default:
           return null;
       }

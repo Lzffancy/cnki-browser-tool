@@ -20,7 +20,7 @@ const DOWNLOAD_WAIT_ALARM = "cnki-pdf-download-wait-timeout";
 // executeBridgeCommand/processNextPdfBatchItem 用这个哨兵区分“已经有明确结果”
 // 和“结果会在下载事件或超时 alarm 触发后异步提交”，避免重复提交。
 const PENDING_ASYNC_RESULT = Symbol("pending-async-download-result");
-const CONTENT_SCRIPT_VERSION = "0.7.8";
+const CONTENT_SCRIPT_VERSION = "0.8.0";
 const SEARCH_HOME_URL = "https://kns.cnki.net/kns8s/defaultresult/index";
 
 const CNKI_MESSAGE = {
@@ -37,7 +37,8 @@ const CNKI_MESSAGE = {
   APPLY_FILTER: "CNKI_APPLY_FILTER",
   SUBMIT_ADVANCED_SEARCH: "CNKI_SUBMIT_ADVANCED_SEARCH",
   GET_DOWNLOAD_OPTIONS: "CNKI_GET_DOWNLOAD_OPTIONS",
-  CLICK_PDF_DOWNLOAD: "CNKI_CLICK_PDF_DOWNLOAD"
+  CLICK_PDF_DOWNLOAD: "CNKI_CLICK_PDF_DOWNLOAD",
+  GET_LOGIN_STATE: "CNKI_GET_LOGIN_STATE"
 };
 
 const recentDownloads = [];
@@ -403,7 +404,7 @@ async function navigateActiveCnkiTab(payload) {
 async function getSessionStatus() {
   const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
   const cnkiTabs = await chrome.tabs.query({ url: ["https://cnki.net/*", "https://*.cnki.net/*"] });
-  return {
+  const status = {
     activeTab: activeTab ? {
       id: activeTab.id,
       url: activeTab.url || null,
@@ -418,6 +419,22 @@ async function getSessionStatus() {
     })),
     canOpenSearch: true
   };
+
+  // 登录状态启发式检测：优先活动 CNKI 标签，其次第一个 CNKI 标签；读不到就明确标注，不猜测。
+  const loginTab = (activeTab && isCnkiPage(activeTab.url || ""))
+    ? activeTab
+    : cnkiTabs.find((tab) => tab?.id != null);
+  if (loginTab?.id) {
+    try {
+      status.login = await readPage(loginTab, CNKI_MESSAGE.GET_LOGIN_STATE);
+    } catch (error) {
+      status.login = { state: "unknown", evidence: `读取登录状态失败：${asErrorMessage(error)}` };
+    }
+  } else {
+    status.login = { state: "no_cnki_tab", evidence: "当前没有打开的 CNKI 标签页，无法检测登录状态" };
+  }
+
+  return status;
 }
 
 async function openSearchPage(payload) {
