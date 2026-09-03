@@ -125,4 +125,6 @@ backend/.venv/Scripts/python.exe backend/bridge_server.py --mode mcp
 
 如果这个工具帮你省了事，欢迎请作者喝杯咖啡。
 
-仓库主页右上角的 **Sponsor** 按钮提供微信赞助入口。收款码图片放在 `sponsor/wechat.png`，配置见 `.github/FUNDING.yml`。
+<div align="center">
+  <img src="sponsor/wechat.png" width="160" alt="微信赞助" />
+</div>
