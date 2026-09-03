@@ -120,3 +120,9 @@ backend/.venv/Scripts/python.exe backend/bridge_server.py --mode mcp
 - 不读取、不导出、不存储 CNKI 登录 Cookie。
 - 不直接调用知网检索或下载接口，只驱动真实页面上的原生交互。
 - 不使用无头浏览器，不规避验证码或访问频率限制。
+
+## 赞助
+
+如果这个工具帮你省了事，欢迎请作者喝杯咖啡。
+
+仓库主页右上角的 **Sponsor** 按钮提供微信赞助入口。收款码图片放在 `sponsor/wechat.png`，配置见 `.github/FUNDING.yml`。

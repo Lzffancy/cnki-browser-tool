@@ -1,0 +1,5 @@
+# 赞助 / 支持本项目
+# 仓库主页右上角的 "Sponsor" 按钮会展示下方入口。
+# 收款码图片放在 sponsor/ 目录下，文件名与链接一一对应即可生效。
+custom:
+  - https://raw.githubusercontent.com/Lzffancy/cnki-browser-tool/main/sponsor/wechat.png
