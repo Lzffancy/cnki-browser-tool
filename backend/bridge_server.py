@@ -24,6 +24,7 @@
 
 import argparse
 import json
+import re
 import sys
 import threading
 import time
@@ -63,6 +64,43 @@ MAX_FLOW_STEPS = 20
 # 扩展每次长轮询都会刷新这个时间戳；/health 用它判断「扩展是否真的连上了本服务」。
 EXTENSION_ALIVE_WINDOW_SECONDS = 90
 DEFAULT_MCP_CALL_TIMEOUT_SECONDS = 40
+
+# 验证码等待上限：填一次验证码通常几十秒，但用户可能离开，给 15 分钟足够宽松。
+MAX_CAPTCHA_WAIT_SECONDS = 900
+# 拦截期间的最小探活间隔。扩展受 BRIDGE_ALARM 限制每 30s 才轮询一次，这个下限
+# 只是防止 alarm 被手工/启动路径密集触发时把探活打满。
+CAPTCHA_PROBE_MIN_INTERVAL_SECONDS = 10
+# 反向确认：连续多少次探活都没再看到验证页，才判定解除。设为 1 会在验证页跳转的
+# 中间态（比如短暂 about:blank）误判；设 2 更稳，代价是多 30 秒。
+CAPTCHA_CLEAR_CONFIRMATIONS = 2
+
+# 判定「被 CNKI 安全验证拦截」的特征。分两级：
+#   URL 级——命中即高置信，直接判拦截；
+#   文本级——需要出现在标题/错误这类短字段里才算，避免正文里出现"验证"二字误伤。
+CAPTCHA_URL_MARKERS = (
+    "/verify/",
+    "verify/home",
+    "captchatype=",
+    "captchaverify",
+    "safeverify",
+)
+CAPTCHA_TEXT_MARKERS = (
+    "请完成安全验证",
+    "安全验证",
+    "请依次点击",
+    "请输入验证码",
+    "拖动滑块",
+    "请完成人机验证",
+    "请完成验证",
+    "滑动验证",
+)
+# 只有这些顶层键对应的字符串才做文本级匹配。正文（text/preview）不参与，
+# 否则一篇讲验证码识别的论文摘要就会把整条链路判成被拦截。
+CAPTCHA_TEXT_KEYS = ("title", "error", "message", "reason", "code", "state", "status")
+_CAPTCHA_SCAN_DEPTH = 6
+# 内置探活命令的 id 前缀。拦截期间服务端向扩展下发的 session.status 探针用此前缀，
+# complete() 借此把探针结果和普通命令结果区分开，走不通的拦截判定逻辑。
+PROBE_PREFIX = "probe-"
 
 # Tool 元数据同时服务于 /health 自描述接口和 MCP Tool 注册。
 # 这里只允许列出受限、可审计的业务动作，禁止扩展为任意 JS 或任意选择器点击。
@@ -177,6 +215,263 @@ TOOL_DESCRIPTIONS: dict[str, dict[str, Any]] = {
 }
 
 
+def _scan_captcha(value: Any, key: str | None = None, depth: int = 0) -> str | None:
+    """递归扫描扩展回传的数据，命中拦截特征时返回证据字符串，否则返回 None。
+
+    设计要点：正文类字段（text/preview/abstract）不参与文本级匹配。CNKI 上能搜到
+    大量讲"验证码识别"的论文，早期版本因为把整页快照丢进来扫，出现过把正常检索
+    结果页误判成拦截、然后整条流水线空转等人工介入的事故。
+    """
+    if depth > _CAPTCHA_SCAN_DEPTH:
+        return None
+    if isinstance(value, str):
+        lowered = value.lower()
+        for marker in CAPTCHA_URL_MARKERS:
+            if marker in lowered:
+                return f"URL 命中 {marker}：{value[:160]}"
+        if key is None or key.lower() in CAPTCHA_TEXT_KEYS:
+            for marker in CAPTCHA_TEXT_MARKERS:
+                if marker in value:
+                    return f"文本命中「{marker}」：{value[:120]}"
+        return None
+    if isinstance(value, dict):
+        for child_key, child in value.items():
+            hit = _scan_captcha(child, str(child_key), depth + 1)
+            if hit:
+                return hit
+        return None
+    if isinstance(value, (list, tuple)):
+        for child in value:
+            hit = _scan_captcha(child, key, depth + 1)
+            if hit:
+                return hit
+    return None
+
+
+class CaptchaGate:
+    """CNKI 安全验证拦截闸门——服务端的全局拦截状态机。
+
+    为什么必须是服务端状态，而不是让每个调用方自己看返回值：
+
+    1. 拦截是**全局**的。不是一个命令失败，而是接下来所有命令都会失败。调用方
+       A 发现了，调用方 B 不知道，B 还会继续撞墙，把风控越惹越凶。
+    2. 判定需要**上下文**。单次 probe 可能落在跳转中间态上，只有服务端的连续
+       探活序列才能可靠判断"真解除了"。
+    3. 恢复需要**有人盯着**。用户填验证码的那一两分钟里，Agent 侧脚本可能已经
+       退出、超时、或者根本没在跑。服务端有常驻线程，可以自己等、自己探、
+       解除后自己放行。
+
+    状态机：
+        clear ──(结果命中特征 / 扩展上报)──> blocked ──(连续 N 次探活干净)──> clear
+                                                │
+                                                └──(达 MAX_CAPTCHA_WAIT_SECONDS)──> 自动放弃，报错
+
+    拦截期间的行为：
+        - 不发任何真实命令给扩展（避免加重风控）
+        - 利用扩展每 30s 的固有轮询，自动下发内置 probe 命令探活
+        - 调用方带 waitForCaptchaSeconds 时，请求挂起在服务端，解除后自动继续执行
+    """
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._blocked = False
+        self._detected_at: float | None = None
+        self._cleared_at: float | None = None
+        self._reason: str = ""
+        self._detail: str = ""
+        self._source: str = ""
+        self._last_probe_at: float = 0.0
+        self._clean_streak = 0
+        self._probe_count = 0
+        self._rounds: list[dict[str, Any]] = []
+        self._pending_probes: dict[str, float] = {}
+        self._epoch = 0
+
+    # ---------- 状态变更 ----------
+
+    def mark_blocked(self, reason: str, detail: str = "", source: str = "") -> bool:
+        """置为拦截态。返回 True 表示这次调用真正触发了状态跃变。"""
+        with self._condition:
+            now = time.time()
+            if self._blocked:
+                # 已经在拦截中：只刷新证据，不重复计数，也不打断等待者。
+                if detail:
+                    self._detail = detail
+                if source:
+                    self._source = source
+                self._clean_streak = 0
+                return False
+            self._blocked = True
+            self._detected_at = now
+            self._reason = reason
+            self._detail = detail
+            self._source = source
+            self._clean_streak = 0
+            self._probe_count = 0
+            self._epoch += 1
+            self._log_round_open(now)
+            self._condition.notify_all()
+            return True
+
+    def mark_cleared(self, source: str = "") -> bool:
+        """置为放行态，唤醒所有等待者。返回 True 表示确实从拦截态解除。"""
+        with self._condition:
+            if not self._blocked:
+                self._clean_streak = 0
+                return False
+            now = time.time()
+            self._blocked = False
+            self._cleared_at = now
+            self._log_round_close(now, source)
+            self._reason = ""
+            self._detail = ""
+            self._source = ""
+            self._clean_streak = 0
+            self._epoch += 1
+            self._condition.notify_all()
+            return True
+
+    def force_clear(self, source: str = "manual") -> bool:
+        """人工强制解除。用于「页面明明正常了但探活没跟上」的兜底。"""
+        with self._condition:
+            if not self._blocked:
+                return False
+            now = time.time()
+            self._blocked = False
+            self._cleared_at = now
+            self._log_round_close(now, source)
+            self._reason = ""
+            self._detail = ""
+            self._source = ""
+            self._clean_streak = 0
+            self._epoch += 1
+            self._condition.notify_all()
+            return True
+
+    # ---------- 查询 ----------
+
+    @property
+    def blocked(self) -> bool:
+        with self._condition:
+            return self._blocked
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._condition:
+            now = time.time()
+            return {
+                "blocked": self._blocked,
+                "reason": self._reason or None,
+                "detail": self._detail or None,
+                "source": self._source or None,
+                "blockedSeconds": round(now - self._detected_at, 1) if self._blocked and self._detected_at else 0.0,
+                "detectedAt": self._detected_at,
+                "clearedAt": self._cleared_at,
+                "secondsSinceCleared": round(now - self._cleared_at, 1) if self._cleared_at else None,
+                "probeCount": self._probe_count,
+                "lastProbeAt": self._last_probe_at or None,
+                "cleanStreak": self._clean_streak,
+                "epoch": self._epoch,
+                "rounds": list(self._rounds[-5:]),
+                "hint": self._hint(),
+            }
+
+    def _hint(self) -> str | None:
+        if not self._blocked:
+            return None
+        return (
+            "CNKI 安全验证拦截中。请在 Chrome 里完成验证（点击文字 / 拖动滑块），"
+            "本服务每约 30 秒自动探活一次，验证通过后会自动放行挂起的任务，无需重启脚本。"
+        )
+
+    def wait_until_clear(self, timeout_seconds: float) -> tuple[bool, float]:
+        """阻塞等待解除。返回 (是否已解除, 实际等待秒数)。
+
+        用 epoch 而不是 blocked 布尔值做等待条件，避免「解除→又被拦截→唤醒」的
+        竞态把等待者误放出去。
+        """
+        deadline = time.monotonic() + max(timeout_seconds, 0)
+        started = time.monotonic()
+        with self._condition:
+            while self._blocked:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False, time.monotonic() - started
+                self._condition.wait(timeout=remaining)
+            return True, time.monotonic() - started
+
+    # ---------- 探活 ----------
+
+    def due_for_probe(self) -> bool:
+        """拦截期间是否该下发一次内置探活命令。"""
+        with self._condition:
+            if not self._blocked:
+                return False
+            if self._pending_probes:
+                return False  # 上一个 probe 还在飞，不重复下发
+            return time.time() - self._last_probe_at >= CAPTCHA_PROBE_MIN_INTERVAL_SECONDS
+
+    def register_probe(self, command_id: str) -> None:
+        with self._condition:
+            self._pending_probes[command_id] = time.time()
+            self._last_probe_at = time.time()
+            self._probe_count += 1
+
+    def resolve_probe(self, command_id: str, result: Any, error: str | None) -> dict[str, Any]:
+        """处理探活结果，返回本次判定摘要。"""
+        self._pending_probes.pop(command_id, None)
+        hit = _scan_captcha(result) or _scan_captcha(error)
+        if hit:
+            with self._condition:
+                self._clean_streak = 0
+                self._detail = hit
+                return {"cleared": False, "evidence": hit, "cleanStreak": 0}
+        with self._condition:
+            self._clean_streak += 1
+            streak = self._clean_streak
+            cleared = False
+            if streak >= CAPTCHA_CLEAR_CONFIRMATIONS:
+                cleared = self.mark_cleared(source="auto-probe")
+            return {"cleared": cleared, "evidence": None, "cleanStreak": streak}
+
+    def inspect_result(self, result: Any, error: str | None, action: str = "") -> str | None:
+        """检查一次普通命令的结果，命中拦截特征则置为拦截态。返回证据。"""
+        hit = _scan_captcha(result) or _scan_captcha(error)
+        if hit:
+            self.mark_blocked(
+                reason=f"CNKI 安全验证拦截（触发动作：{action or '未知'}）",
+                detail=hit,
+                source=f"action:{action or 'unknown'}",
+            )
+        elif self.blocked:
+            # 普通命令在拦截期间不该被下发；若确实收到了干净结果，也计入解除凭据。
+            with self._condition:
+                self._clean_streak += 1
+                if self._clean_streak >= CAPTCHA_CLEAR_CONFIRMATIONS:
+                    self.mark_cleared(source=f"action:{action or 'unknown'}")
+        return hit
+
+    # ---------- 历史 ----------
+
+    def _log_round_open(self, now: float) -> None:
+        self._rounds.append({
+            "detectedAt": now,
+            "clearedAt": None,
+            "durationSeconds": None,
+            "probeCount": 0,
+            "reason": self._reason,
+            "source": self._source,
+        })
+
+    def _log_round_close(self, now: float, source: str) -> None:
+        if not self._rounds:
+            return
+        last = self._rounds[-1]
+        last["clearedAt"] = now
+        last["durationSeconds"] = round(now - (last["detectedAt"] or now), 1)
+        last["probeCount"] = self._probe_count
+        last["resolvedBy"] = source
+
+
 @dataclass
 class Command:
     command_id: str
@@ -187,6 +482,7 @@ class Command:
     completed: bool = False
     result: Any = None
     error: str | None = None
+    abandoned: bool = False
 
 
 class CommandBroker:
@@ -209,6 +505,11 @@ class CommandBroker:
         deadline = time.monotonic() + timeout_seconds
         with self._condition:
             while True:
+                # 拦截期间绝不下发真实命令给扩展：填验证码的窗口期里任何额外页面
+                # 操作都可能加重风控、触发更严的验证。真实命令先排队，等 GATE 解除后
+                # 自动放行。探活由 do_GET /v1/extension/next-command 单独注入。
+                if GATE.blocked:
+                    return None
                 while self._queue:
                     command_id = self._queue.pop(0)
                     command = self._commands.get(command_id)
@@ -229,8 +530,52 @@ class CommandBroker:
             command.result = result
             command.error = error
             command.completed = True
+            is_probe = command_id.startswith(PROBE_PREFIX)
             self._condition.notify_all()
-            return True
+        # 锁外做拦截判定：避免 GATE 内部再次取锁造成的重入，也让判定逻辑独立演进。
+        if is_probe:
+            GATE.resolve_probe(command_id, result, error)
+        else:
+            action = command.action if command else ""
+            GATE.inspect_result(result, error, action)
+        return True
+
+    def abandon(self, command: Command, reason: str = "调用方超时放弃") -> None:
+        """调用方超时放弃：把命令移出队列并标记为已结束。
+
+        不做这一步的话，超时命令会永久滞留在队列里——next_command() 只跳过
+        completed 的命令，于是僵尸命令仍会被逐个交付给扩展执行，新命令只能排
+        在它们后面。而扩展受 BRIDGE_ALARM（periodInMinutes=0.5，即 30s）限制
+        每次只拉一个命令，积压一旦形成，所有新调用都会持续超时且无任何报错，
+        极难定位。典型诱因：调用方频繁用短超时重试。
+        """
+        with self._condition:
+            if command.command_id in self._queue:
+                self._queue.remove(command.command_id)
+            if not command.completed:
+                command.completed = True
+                command.abandoned = True
+                command.error = reason
+            self._condition.notify_all()
+
+    def purge_stale(self, max_age_seconds: float = 120.0) -> int:
+        """清理长时间未被交付的陈旧命令（兜底自愈），返回清理条数。"""
+        now = time.time()
+        removed = 0
+        with self._condition:
+            for command_id, command in list(self._commands.items()):
+                if command.completed or command.delivered:
+                    continue
+                if now - command.created_at > max_age_seconds:
+                    if command_id in self._queue:
+                        self._queue.remove(command_id)
+                    command.completed = True
+                    command.abandoned = True
+                    command.error = "陈旧命令已自动清理"
+                    removed += 1
+            if removed:
+                self._condition.notify_all()
+        return removed
 
     def wait_for_result(self, command: Command, timeout_seconds: int) -> Command:
         deadline = time.monotonic() + timeout_seconds
@@ -244,6 +589,9 @@ class CommandBroker:
 
 
 BROKER = CommandBroker()
+# 全局唯一的拦截闸门。HTTP 模式与 MCP 模式共享，因此无论 Agent 从哪条链路进来，
+# 看到的拦截状态和等待行为都是一致的。
+GATE = CaptchaGate()
 
 
 class SingleInstanceHTTPServer(ThreadingHTTPServer):
@@ -318,9 +666,17 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                         "并保持 Chrome 运行；扩展最长约 30 秒轮询一次。"
                     )
                 },
+                "captcha": {
+                    **GATE.snapshot(),
+                    "autoResume": True,
+                },
                 "allowedActions": sorted(ALLOWED_ACTIONS),
                 "tools": {action: TOOL_DESCRIPTIONS[action] for action in sorted(ALLOWED_ACTIONS)}
             })
+            return
+
+        if parsed.path == "/v1/captcha/status":
+            self._send_json(HTTPStatus.OK, {"ok": True, "captcha": GATE.snapshot()})
             return
 
         if parsed.path == "/v1/extension/next-command":
@@ -330,6 +686,24 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                 wait_seconds = min(max(int(raw_wait), 1), 25)
             except ValueError:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "wait 必须为整数。"})
+                return
+
+            # 拦截期间优先探活：不下发任何真实命令（避免加重风控），改向扩展注入一次
+            # 内置 session.status 探针。探针结果回传后由 complete()→resolve_probe() 判定
+            # 是否已解除；连续 2 次干净即自动放行后续排队命令。无需任何客户端轮询。
+            if GATE.due_for_probe():
+                probe_id = PROBE_PREFIX + uuid.uuid4().hex
+                with BROKER._condition:
+                    probe = Command(command_id=probe_id, action="session.status", payload={})
+                    probe.delivered = True
+                    BROKER._commands[probe_id] = probe
+                GATE.register_probe(probe_id)
+                self._send_json(HTTPStatus.OK, {
+                    "id": probe_id,
+                    "action": "session.status",
+                    "payload": {},
+                    "isProbe": True,
+                })
                 return
 
             command = BROKER.next_command(wait_seconds)
@@ -375,6 +749,41 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "timeoutSeconds 必须为整数。"})
                 return
 
+            # ---- 验证码拦截闸门 ----
+            # 被 CNKI 安全验证挡住时，本服务**自己知道**被拦截了，不会盲目给扩展下命令，
+            # 而是：要么立刻返回明确的 503（blocked:true）让调用方知情，要么按
+            # waitForCaptchaSeconds 在**服务端原地等待**用户填完验证码，解除后自动继续执行，
+            # 全程对调用方透明——这就是「服务感知拦截、等待人工、自动续跑」的闭环。
+            wait_captcha = payload.get("waitForCaptchaSeconds", 0)
+            if wait_captcha is True:
+                wait_captcha = MAX_CAPTCHA_WAIT_SECONDS
+            try:
+                wait_captcha = max(0, min(int(wait_captcha), MAX_CAPTCHA_WAIT_SECONDS))
+            except (TypeError, ValueError):
+                wait_captcha = 0
+
+            if GATE.blocked:
+                if wait_captcha > 0:
+                    cleared, waited = GATE.wait_until_clear(wait_captcha)
+                    if not cleared:
+                        self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {
+                            "ok": False,
+                            "blocked": True,
+                            "error": "等待验证码超时（已等待约 %d 秒）。请确认已在 Chrome 中完成安全验证后再试。" % int(waited),
+                            "captcha": GATE.snapshot(),
+                        })
+                        return
+                    # 已解除，继续往下正常执行本次调用
+                else:
+                    self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {
+                        "ok": False,
+                        "blocked": True,
+                        "error": "CNKI 安全验证拦截中。请在 Chrome 中完成验证（点击文字 / 拖动滑块），本服务会自动放行后续任务，无需重启脚本。",
+                        "captcha": GATE.snapshot(),
+                        "howToWait": "带上 waitForCaptchaSeconds 参数，让本服务原地等待验证完成后再继续。",
+                    })
+                    return
+
             # flow.run 由本服务拆解为逐步基础动作，在服务端串行执行；
             # 扩展侧对此无感知，每一步仍是与单独调用等价的一次入队+等待。
             if action == "flow.run":
@@ -419,23 +828,95 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK if accepted else HTTPStatus.NOT_FOUND, {"ok": accepted})
             return
 
+        if parsed.path == "/v1/extension/captcha-report":
+            # 扩展侧主动上报：导航到安全验证页时立即 POST blocked=true（秒级），无需等 30s 轮询。
+            blocked = bool(payload.get("blocked", False))
+            detail = payload.get("detail") or payload.get("url") or ""
+            if not isinstance(detail, str):
+                detail = str(detail)
+            if blocked:
+                GATE.mark_blocked(
+                    reason="扩展主动上报：检测到安全验证页",
+                    detail=detail[:300],
+                    source="extension-webNavigation",
+                )
+                self._send_json(HTTPStatus.OK, {"ok": True, "blocked": True, "captcha": GATE.snapshot()})
+                return
+            # 上报「已离开验证页」：扩展在 kns 正常页 onCompleted 时调用，作为实时强证据直接解除。
+            cleared = GATE.mark_cleared(source="extension-webNavigation")
+            self._send_json(HTTPStatus.OK, {"ok": True, "blocked": False, "cleared": cleared, "captcha": GATE.snapshot()})
+            return
+
+        if parsed.path == "/v1/captcha/wait":
+            # 阻塞等待解除。调用方（Agent / 脚本）不再需要自己轮询，一次请求等到底。
+            try:
+                wait_seconds = int(payload.get("timeoutSeconds", MAX_CAPTCHA_WAIT_SECONDS))
+            except (TypeError, ValueError):
+                wait_seconds = MAX_CAPTCHA_WAIT_SECONDS
+            wait_seconds = max(1, min(wait_seconds, MAX_CAPTCHA_WAIT_SECONDS))
+            if not GATE.blocked:
+                self._send_json(HTTPStatus.OK, {"ok": True, "cleared": True, "waitedSeconds": 0.0, "captcha": GATE.snapshot()})
+                return
+            cleared, waited = GATE.wait_until_clear(wait_seconds)
+            self._send_json(
+                HTTPStatus.OK if cleared else HTTPStatus.SERVICE_UNAVAILABLE,
+                {"ok": cleared, "cleared": cleared, "waitedSeconds": round(waited, 1), "captcha": GATE.snapshot()},
+            )
+            return
+
+        if parsed.path == "/v1/captcha/clear":
+            # 人工强制解除：用于「页面已正常但探活没跟上」的兜底，或调试用途。
+            source = payload.get("source") or "manual"
+            if not isinstance(source, str):
+                source = "manual"
+            cleared = GATE.force_clear(source=source[:40])
+            self._send_json(HTTPStatus.OK, {"ok": True, "cleared": cleared, "captcha": GATE.snapshot()})
+            return
+
         self._not_found()
 
 
-def run_bridge_action(action: str, payload: dict[str, Any], timeout_seconds: int = DEFAULT_MCP_CALL_TIMEOUT_SECONDS) -> Any:
+def run_bridge_action(
+    action: str,
+    payload: dict[str, Any],
+    timeout_seconds: int = DEFAULT_MCP_CALL_TIMEOUT_SECONDS,
+    wait_captcha_seconds: int = 0,
+) -> Any:
     """把一次 Tool 调用放进队列并同步等待扩展执行结果。
 
     供 MCP Tool 处理函数复用；成功返回 `completed.result`，失败/超时抛出
     RuntimeError，交由调用方（MCP 框架）转换成协议层的错误响应。
+
+    ``wait_captcha_seconds > 0`` 时，若遇到 CNKI 安全验证拦截，会在**服务端原地等待**
+    用户填完验证码，解除后自动重新下发本命令，对调用方透明。
     """
     if action not in ALLOWED_ACTIONS:
         raise RuntimeError(f"不支持的 Tool：{action}。")
     bounded_timeout = min(max(int(timeout_seconds), 1), MAX_CALL_TIMEOUT_SECONDS)
+    # 拦截闸门：被安全验证挡住时先不盲目下发命令，而是等待人工或立即报错。
+    if GATE.blocked:
+        if wait_captcha_seconds and wait_captcha_seconds > 0:
+            wait_captcha_seconds = min(int(wait_captcha_seconds), MAX_CAPTCHA_WAIT_SECONDS)
+            cleared, waited = GATE.wait_until_clear(wait_captcha_seconds)
+            if not cleared:
+                raise RuntimeError(
+                    f"等待验证码解除超时（约 {int(waited)} 秒）。请在 Chrome 中完成安全验证后重试。"
+                )
+        else:
+            raise RuntimeError(
+                "CNKI 安全验证拦截中：本服务已暂停下发命令。请在 Chrome 中完成验证"
+                "（点击文字 / 拖动滑块），解除后会自动续跑；也可调用 captcha.wait 等待解除。"
+            )
+    BROKER.purge_stale()
     command = BROKER.enqueue(action, payload)
     completed = BROKER.wait_for_result(command, bounded_timeout)
     if not completed.completed:
+        # 关键：超时后必须放弃该命令，否则它会滞留在队列里被扩展"补执行"，
+        # 把后续命令全部挤到后面（扩展 30s 才拉一个），造成持续超时。
+        BROKER.abandon(command)
         raise RuntimeError(
-            "等待插件响应超时。请确认 Chrome 已加载插件、CNKI 页面已授权，并等待下一次轮询。"
+            "等待插件响应超时（该命令已移出队列，不会积压）。请确认 Chrome 已加载插件、"
+            "CNKI 页面已授权；注意扩展每 30s 才拉取一次命令，超时建议设置为 40s 以上。"
         )
     if completed.error:
         raise RuntimeError(completed.error)
@@ -727,6 +1208,30 @@ def build_mcp_server() -> Any:
         if error:
             raise RuntimeError(error)
         return result
+
+    @mcp.tool(
+        name="captcha.status",
+        description="查询 CNKI 安全验证拦截状态：是否被拦截、拦截了多久、证据（命中哪种特征）、"
+        "是否会自动续跑，以及最近几轮拦截的历史。拦截发生时任务会在服务端挂起并自动等待人工放行。",
+    )
+    def captcha_status() -> Any:
+        return GATE.snapshot()
+
+    @mcp.tool(
+        name="captcha.wait",
+        description="阻塞等待验证码拦截解除（上限 900 秒）。解除后返回实际等待秒数；超时则返回 cleared=false。"
+        "调用方无需自己轮询，一次调用等到底。",
+    )
+    def captcha_wait(
+        timeout_seconds: Annotated[
+            int,
+            Field(default=MAX_CAPTCHA_WAIT_SECONDS, ge=1, le=MAX_CAPTCHA_WAIT_SECONDS, description="最长等待秒数。"),
+        ] = MAX_CAPTCHA_WAIT_SECONDS,
+    ) -> Any:
+        if not GATE.blocked:
+            return {"cleared": True, "waitedSeconds": 0.0, **GATE.snapshot()}
+        cleared, waited = GATE.wait_until_clear(timeout_seconds)
+        return {"cleared": cleared, "waitedSeconds": round(waited, 1), **GATE.snapshot()}
 
     return mcp
 

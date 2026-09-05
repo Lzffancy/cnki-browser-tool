@@ -8,6 +8,18 @@ venv/
 _*.py
 _paper_txt/
 
+# 本机个人路径配置：含系统用户名、论文目录等，绝不入库
+# 模板见 local_config.example.json，路径解析见 local_paths.py
+local_config.json
+
+# 已被 cnki_client.py 取代的历史迭代脚本：
+# 其有价值的部分（collect/maybe_typo/ensure_server/safe_title）已并入
+# cnki_client.py 的「探索·检索」与「逐个下载」章节。
+# 这些文件仅在本机留作参考，不入库，避免仓库里躺着多份废弃实现。
+humanlike_cnki.py
+continue_cnki.py
+run_remaining.py
+
 # Debug / captured page dumps (large, may contain scraped page content)
 *-dom.json
 current-search-dom.json

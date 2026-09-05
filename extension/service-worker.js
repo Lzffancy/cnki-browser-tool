@@ -979,3 +979,57 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     });
   return true;
 });
+
+// ---- 安全验证页主动上报 ----
+// 服务端有独立的验证码拦截闸门（CaptchaGate）。它最可靠、最及时的拦截情报来源，
+// 不是等 30s 轮询探活，而是扩展在 Chrome 真正导航到验证页的那一刻直接上报。这样
+// 用户刚弹出验证码，服务端就进入等待态并暂停下发命令，用户填完、页面跳回 kns，
+// 再一次上报即解除、自动续跑。配合 manifest 的 webNavigation 权限。
+let lastCaptchaReport = null; // "blocked" | "clear" | null，防止重复上报刷屏
+
+function isCaptchaUrl(url) {
+  if (typeof url !== "string") return false;
+  const lower = url.toLowerCase();
+  return (
+    lower.includes("/verify/") ||
+    lower.includes("verify/home") ||
+    lower.includes("captchatype=") ||
+    lower.includes("captchaverify") ||
+    lower.includes("safeverify")
+  );
+}
+
+function isCnkiUrlSafe(url) {
+  return typeof url === "string" && /^https:\/\/([^/]+\.)?cnki\.net\//.test(url);
+}
+
+async function reportCaptchaState(blocked, url) {
+  const state = blocked ? "blocked" : "clear";
+  if (state === lastCaptchaReport) return;
+  lastCaptchaReport = state;
+  try {
+    await fetch(`${BRIDGE_BASE_URL}/v1/extension/captcha-report`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ blocked, url: url || "" })
+    });
+  } catch {
+    // 本机 Python 服务未启动时静默，等下一次导航再试。
+  }
+}
+
+if (chrome.webNavigation) {
+  const handleNavigation = (details) => {
+    // 只看顶级 frame，子 frame（iframe 里的验证组件）不计，避免重复/误报。
+    if (details.frameId !== 0) return;
+    const url = details.url;
+    if (isCaptchaUrl(url)) {
+      void reportCaptchaState(true, url);
+    } else if (isCnkiUrlSafe(url)) {
+      // 进入正常 CNKI 页 → 视为解除，立即上报 clear。
+      void reportCaptchaState(false, url);
+    }
+  };
+  chrome.webNavigation.onCommitted.addListener(handleNavigation);
+  chrome.webNavigation.onCompleted.addListener(handleNavigation);
+}
